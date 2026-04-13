@@ -1,0 +1,19 @@
+{
+  "name": "LHPerL",
+  "paths": {
+    "h5":    "datasets/LH_Per_L_DtP.h5",
+    "calib": "datasets/calib_matrix.csv"
+  },
+  "train_val_test_split": [0.70, 0.15, 0.15],
+  "series_per_data":  [50, 10, 10],
+  "train_test_range": [1, 1, 1],
+  "frame_rate": [2, 8],
+  "source": {
+    "width":   320,
+    "height":  240,
+    "channel": 6
+  },
+  "target": {
+    "elements": 15
+  }
+}

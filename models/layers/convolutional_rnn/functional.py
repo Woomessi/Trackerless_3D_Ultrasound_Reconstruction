@@ -141,7 +141,7 @@ def StackedRNN(inners, num_layers, lstm=False, dropout=0, train=True):
 
 
 def Recurrent(inner, reverse=False):
-    """ Copied from torch.nn._functions.rnn without any modification """
+    """ Copied from torch.nn._functions.rnn without any trial """
     def forward(input, hidden, weight, batch_sizes):
         output = []
         steps = range(input.size(0) - 1, -1, -1) if reverse else range(input.size(0))
@@ -160,7 +160,7 @@ def Recurrent(inner, reverse=False):
 
 
 def variable_recurrent_factory(inner, reverse=False):
-    """ Copied from torch.nn._functions.rnn without any modification """
+    """ Copied from torch.nn._functions.rnn without any trial """
     if reverse:
         return VariableRecurrentReverse(inner)
     else:
@@ -168,7 +168,7 @@ def variable_recurrent_factory(inner, reverse=False):
 
 
 def VariableRecurrent(inner):
-    """ Copied from torch.nn._functions.rnn without any modification """
+    """ Copied from torch.nn._functions.rnn without any trial """
     def forward(input, hidden, weight, batch_sizes):
         output = []
         input_offset = 0
@@ -208,7 +208,7 @@ def VariableRecurrent(inner):
 
 
 def VariableRecurrentReverse(inner):
-    """ Copied from torch.nn._functions.rnn without any modification """
+    """ Copied from torch.nn._functions.rnn without any trial """
     def forward(input, hidden, weight, batch_sizes):
         output = []
         input_offset = input.size(0)

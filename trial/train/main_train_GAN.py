@@ -13,15 +13,11 @@ import utils
 
 class Main(object):
 
-    def __init__(self, args):
-        self.args = args
-        self.model_cfg = configs.BaseConfig(utils.common.real_config_path(
-            args.model_config_path, configs.env.paths.model_cfgs_folder))
-        self.run_cfg = configs.Run(utils.common.real_config_path(
-            args.run_config_path, configs.env.paths.run_cfgs_folder), gpus=args.gpus)
-        self.dataset_cfg = datasets.functional.common.more(configs.BaseConfig(
-            utils.common.real_config_path(args.dataset_config_path, configs.env.paths.dataset_cfgs_folder)))
-        print(args)
+    def __init__(self):
+        self.model_cfg = configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_d.json')
+        self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_d.json',
+                                   gpus='0')
+        self.dataset_cfg = datasets.functional.common.more(configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/datasets/LHPerL.json'))
 
         self._init()
         self._get_component()
@@ -38,7 +34,7 @@ class Main(object):
         self.dataset = datasets.functional.common.find(self.dataset_cfg.name)(self.dataset_cfg, logger=self.logger)
         self.model = models.functional.common.find(self.model_cfg.name)(
             self.model_cfg, self.dataset.cfg, self.run_cfg, dataset=self.dataset, logger=self.logger, main_msg=self.msg)
-        self.start_epoch = self.model.load(self.args.test_epoch)
+        self.start_epoch = self.model.load(None)
 
     def show_cfgs(self):
         self.logger.info(self.model.cfg)
@@ -137,30 +133,17 @@ class Main(object):
 
 
 def run():
-    parser = argparse.ArgumentParser(description='RecON')
-    parser.add_argument('-m', '--model_config_path', type=str, required=True, metavar='/path/to/model/config.json',
-                        help='Path to model config .json file')
-    parser.add_argument('-r', '--run_config_path', type=str, required=True, metavar='/path/to/run/config.json',
-                        help='Path to run config .json file')
-    parser.add_argument('-d', '--dataset_config_path', type=str, required=True, metavar='/path/to/dataset/config.json',
-                        help='Path to dataset config .json file')
-    parser.add_argument('-g', '--gpus', type=str, default='0', metavar='cuda device, i.e. 0 or cpu',
-                        help='cuda device, i.e. 0 or cpu')
-    parser.add_argument('-t', '--test_epoch', type=int, metavar='epoch want to test', help='epoch want to test')
-    args = parser.parse_args()
 
-    main = Main(args)
+    main = Main()
     main.split()
-    if args.test_epoch is None:
-        if main.start_epoch == 0:
-            main.val_test(main.start_epoch)
-        for epoch in range(main.start_epoch + 1, main.run_cfg.epochs + 1):
-            main.train(epoch)
-            if epoch % main.run_cfg.save_step == 0:
-                main.val_test(epoch)
-    else:
-        main.test(main.start_epoch)
 
+
+    if main.start_epoch == 0:
+        main.val_test(main.start_epoch)
+    for epoch in range(main.start_epoch + 1, main.run_cfg.epochs + 1):
+        main.train(epoch)
+        if epoch % main.run_cfg.save_step == 0:
+            main.val_test(epoch)
 
 if __name__ == '__main__':
     run()

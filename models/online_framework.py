@@ -90,7 +90,7 @@ class Online_Framework(models.BaseModel):
                 with torch.no_grad():
                     fake_gaps, _ = self.backbone(real_input, return_feature=False)
                     fake_gaps = torch.cat([fake_gaps[:, :, :3], fake_gaps[:, :, 3:] / 100], dim=-1)
-
+                # 3.2.2. Path-level similarity constraint
                 for idx_psc in range(1, self.cfg.psc_epoch + 1):
                     with torch.no_grad():
                         corr = np.Inf
@@ -126,7 +126,7 @@ class Online_Framework(models.BaseModel):
                     loss.backward()
                     self.optimizer_psc.step()
                 torch.cuda.empty_cache()
-
+                # 3.2.3. Global adversarial shape prior
                 if idx % self.cfg.discriminator_opt_cycle == 0:
                     with torch.no_grad():
                         d_idx = torch.randint(self.dataset.trainset_length, (1,), dtype=torch.long, device=self.device)
@@ -158,7 +158,7 @@ class Online_Framework(models.BaseModel):
                     loss_d.backward()
                     self.optimizer_d.step()
                 torch.cuda.empty_cache()
-
+                # 3.2.1. Frame-level contextual consistency
                 self.optimizer_g.zero_grad()
 
                 fake_gaps, _ = self.backbone(real_input, return_feature=False)

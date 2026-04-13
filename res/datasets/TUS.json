@@ -1,0 +1,19 @@
+{
+  "name": "TUS",
+  "paths": {
+    "h5":    "data/frames_transfs",
+    "calib": "data/calib_matrix.csv"
+  },
+  "train_val_test_split": [0.60, 0.20, 0.20],
+  "train_test_range": [1, 1, 1],
+  "series_per_data":  [50, 10, 10],
+  "frame_rate": [2, 8],
+  "source": {
+    "width":   320,
+    "height":  240,
+    "channel": 6
+  },
+  "target": {
+    "elements": 15
+  }
+}

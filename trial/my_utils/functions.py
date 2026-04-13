@@ -107,25 +107,25 @@ def get_matrix(series, mat_scale=None):
     return axis
 
 
-def transform(points, height, width):
-    axis = get_axis(points).permute(0, 2, 1)
+# def transform(points, height, width):
+#     axis = get_axis(points).permute(0, 2, 1)
+#
+#     if not hasattr(transform, 'mesh') or height != transform.height or width != transform.width:
+#         range_x = torch.arange(-(height - 1) / 2, (height + 1) / 2, dtype=points.dtype, device=points.device)
+#         range_y = torch.arange(-(width - 1) / 2, (width + 1) / 2, dtype=points.dtype, device=points.device)
+#         mesh_x, mesh_y = torch.meshgrid(range_x, range_y, indexing='ij')
+#         mesh = torch.stack([mesh_y, -mesh_x, torch.zeros_like(mesh_x)], dim=-1)
+#         transform.mesh = mesh
+#         transform.height = height
+#         transform.width = width
+#
+#     center = points[:, 0, :].unsqueeze(1).unsqueeze(1)
+#
+#     local_mesh = torch.einsum('Nij,HWj->NHWi', axis, transform.mesh) + center
+#     return local_mesh
 
-    if not hasattr(transform, 'mesh') or height != transform.height or width != transform.width:
-        range_x = torch.arange(-(height - 1) / 2, (height + 1) / 2, dtype=points.dtype, device=points.device)
-        range_y = torch.arange(-(width - 1) / 2, (width + 1) / 2, dtype=points.dtype, device=points.device)
-        mesh_x, mesh_y = torch.meshgrid(range_x, range_y, indexing='ij')
-        mesh = torch.stack([mesh_y, -mesh_x, torch.zeros_like(mesh_x)], dim=-1)
-        transform.mesh = mesh
-        transform.height = height
-        transform.width = width
 
-    center = points[:, 0, :].unsqueeze(1).unsqueeze(1)
-
-    local_mesh = torch.einsum('Nij,HWj->NHWi', axis, transform.mesh) + center
-    return local_mesh
-
-
-def reco(source, series, mat_scale=None, volume_size=None):
+def reco(source, series, scale_w, scale_h, mat_scale=None, volume_size=None):
     if volume_size is not None:
         reco_size = volume_size
         if not hasattr(reco, 'bias'):
@@ -137,6 +137,9 @@ def reco(source, series, mat_scale=None, volume_size=None):
 
     matrix = get_matrix(series, mat_scale)
     matrix = torch.stack([-matrix[:, 1], matrix[:, 0], matrix[:, 2]], dim=1)
+    matrix = matrix.clone() # 避免破坏反向传播
+    matrix[:, 0] = matrix[:, 0] / scale_h  # 转换为像素单位
+    matrix[:, 1] = matrix[:, 1] / scale_w  # 转换为像素单位
 
     if not hasattr(reco, 'reco_mesh') or reco_size != reco.reco_size:
         reco_mesh = torch.meshgrid([torch.arange(0.5, length + 0.5, dtype=source.dtype, device=series.device) for length in reco_size], indexing='ij')
@@ -150,8 +153,40 @@ def reco(source, series, mat_scale=None, volume_size=None):
     return volume, bias
 
 
-def get_slice(volume, series, shape):
-    mesh = transform(series, *shape)
+# def get_slice(volume, series, shape):
+#     mesh = transform(series, *shape)
+#     if not hasattr(get_slice, 'volume_size') or volume.shape != get_slice.shape:
+#         get_slice.volume_size = torch.tensor(volume.shape, dtype=mesh.dtype, device=mesh.device).unsqueeze(0).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+#         get_slice.shape = volume.shape
+#     mesh = mesh.unsqueeze(0) / get_slice.volume_size
+#     mesh = (mesh * 2 - 1).flip(-1)
+#     slices = F.grid_sample(volume.unsqueeze(0).unsqueeze(0), mesh, mode='bilinear', padding_mode='border', align_corners=False)
+#     slices = slices.squeeze(1).unsqueeze(2)
+#     return slices
+
+def transform(points, height, width, scale_h=1.0, scale_w=1.0):
+    axis = get_axis(points).permute(0, 2, 1)
+
+    if not hasattr(transform, 'mesh') or height != transform.height or width != transform.width \
+            or scale_h != transform.scale_h or scale_w != transform.scale_w:
+        range_x = torch.arange(-(height - 1) / 2, (height + 1) / 2, dtype=points.dtype, device=points.device)
+        range_y = torch.arange(-(width - 1) / 2, (width + 1) / 2, dtype=points.dtype, device=points.device)
+        mesh_x, mesh_y = torch.meshgrid(range_x, range_y, indexing='ij')
+        # 乘以 scale：像素偏移 → mm 偏移
+        mesh = torch.stack([mesh_y * scale_w, -mesh_x * scale_h, torch.zeros_like(mesh_x)], dim=-1)
+        transform.mesh = mesh
+        transform.height = height
+        transform.width = width
+        transform.scale_h = scale_h
+        transform.scale_w = scale_w
+
+    center = points[:, 0, :].unsqueeze(1).unsqueeze(1)
+    local_mesh = torch.einsum('Nij,HWj->NHWi', axis, transform.mesh) + center
+    return local_mesh
+
+
+def get_slice(volume, series, shape, scale_h=1.0, scale_w=1.0):
+    mesh = transform(series, *shape, scale_h=scale_h, scale_w=scale_w)
     if not hasattr(get_slice, 'volume_size') or volume.shape != get_slice.shape:
         get_slice.volume_size = torch.tensor(volume.shape, dtype=mesh.dtype, device=mesh.device).unsqueeze(0).unsqueeze(0).unsqueeze(0).unsqueeze(0)
         get_slice.shape = volume.shape

@@ -19,6 +19,7 @@ class Run(configs.BaseConfig):
         self._more()
 
     def _more(self):
+######################################################
         self._set_gpus()
         if self.gpus:
             self.cuda = torch.cuda.is_available() and getattr(self, 'cuda', True)
@@ -26,7 +27,10 @@ class Run(configs.BaseConfig):
         else:
             self.cuda = False
             self.device = torch.device('cpu')
-
+######################################################
+        # self.cuda = False
+        # self.device = torch.device('cpu')
+######################################################
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = True

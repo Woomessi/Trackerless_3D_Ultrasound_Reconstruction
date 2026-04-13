@@ -3,6 +3,7 @@ import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import efficientnet_b1
 
 import models
 import utils
@@ -12,46 +13,41 @@ class Backbone(nn.Module):
 
     def __init__(self, in_planes, num_classes):
         super().__init__()
-        self.resnet = timm.create_model('resnet18', pretrained=True, in_chans=in_planes, num_classes=0, global_pool='')
-        self.lstm = models.layers.convolutional_rnn.Conv2dLSTM(512, 512, kernel_size=3, batch_first=True)
+        # self.resnet = timm.create_model('resnet18', pretrained=True, in_chans=in_planes, num_classes=0, global_pool='')
+        # self.lstm = models.layers.convolutional_rnn.Conv2dLSTM(512, 512, kernel_size=3, batch_first=True)
+        # self.avg = nn.AdaptiveAvgPool2d(1)
+        # self.fc = nn.Linear(512, num_classes)
+
+        # self.efficientnet_b1 = efficientnet_b1(weights=None)
+        # self.efficientnet_b1 = timm.create_model('efficientnet_b1', pretrained=True, in_chans=in_planes, num_classes=num_classes, global_pool='')
+        self.efficientnet_b1 = timm.create_model('efficientnet_b1', pretrained=True, in_chans=in_planes, num_classes=num_classes)
         self.avg = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x, return_feature=False):
         b, t, c, h, w = x.shape
         x = (x - torch.mean(x, dim=[3, 4], keepdim=True)) / (torch.std(x, dim=[3, 4], keepdim=True) + 1e-6)
         x = x.view(b * t, c, h, w)
-        x = self.resnet(x)
+
+        # x = self.resnet(x)
+        x = self.efficientnet_b1(x)
+
         x = x.view(b, t, *x.shape[1:])
+
         if return_feature:
             f = self.avg(x)
             f = f.view(f.size(0), f.size(1), -1)
         else:
             f = None
-        x = self.lstm(x)[0]
-        x = self.avg(x)
-        x = x.view(x.size(0), x.size(1), -1)
-        x = self.fc(x)
+
+        # x = self.lstm(x)[0]
+        # x = self.avg(x)
+        # x = x.view(x.size(0), x.size(1), -1)
+        # x = self.fc(x)
+
         return x, f
 
-    def forward_pairs(self, source, edge, of, return_feature=False):
-        """Run forward on each adjacent pair and concatenate results."""
-        N = source.shape[1] - 1
-        gaps_list, feat_list = [], []
-        for i in range(N):
-            inp = torch.cat([source[:, i:i+1], source[:, i+1:i+2],
-                             edge[:, i:i+1], edge[:, i+1:i+2],
-                             of[:, i:i+1]], dim=2)
-            g, f = self(inp, return_feature=return_feature)
-            gaps_list.append(g)
-            if f is not None:
-                feat_list.append(f)
-        gaps = torch.cat(gaps_list, dim=1)
-        feat = torch.cat(feat_list, dim=1) if feat_list else None
-        return gaps, feat
 
-
-class Online_Backbone(models.BaseModel):
+class Online_Baseline_Backbone(models.BaseModel):
 
     def __init__(self, cfg, data_cfg, run, **kwargs):
         super().__init__(cfg, data_cfg, run, **kwargs)
@@ -89,7 +85,17 @@ class Online_Backbone(models.BaseModel):
 
         self.backbone.train()
         self.optimizer.zero_grad()
-        input = torch.cat([real_source[:, :-1, ...], real_source[:, 1:, ...], edge[:, :-1, ...], edge[:, 1:, ...], optical_flow], dim=2)
+
+        #################
+        ### 6 channel ###
+        #################
+        # input = torch.cat([real_source[:, :-1, ...], real_source[:, 1:, ...], edge[:, :-1, ...], edge[:, 1:, ...], optical_flow], dim=2)
+
+        #################
+        ### 2 channel ###
+        #################
+        input = torch.cat([real_source[:, :-1, ...], real_source[:, 1:, ...]], dim=2)
+
         fake_target, feature = self.backbone(input, return_feature=self.flag_motion)
 
         losses = self.criterion(real_target, fake_target, feature)
@@ -109,9 +115,17 @@ class Online_Backbone(models.BaseModel):
         real_series = real_target[:, -9:].view(-1, 3, 3)
 
         self.backbone.eval()
-        ##########################
-        input = torch.cat([real_source[:, :-1, ...], real_source[:, 1:, ...], edge[:, :-1, ...], edge[:, 1:, ...], optical_flow], dim=2)
-        ##########################
+
+        #################
+        ### 6 channel ###
+        #################
+        # input = torch.cat([real_source[:, :-1, ...], real_source[:, 1:, ...], edge[:, :-1, ...], edge[:, 1:, ...], optical_flow], dim=2)
+
+        #################
+        ### 2 channel ###
+        #################
+        input = torch.cat([real_source[:, :-1, ...], real_source[:, 1:, ...]], dim=2)
+
         fake_gaps, _ = self.backbone(input)
         fake_gaps = fake_gaps[0, :, :]
         fake_gaps[:, 3:] /= 100
