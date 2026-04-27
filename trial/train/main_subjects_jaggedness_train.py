@@ -19,13 +19,14 @@ import utils
 class Main(object):
 
     def __init__(self):
-        self.model_cfg = configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_baseline_bk.json')
+        self.model_cfg = configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_jagged_bk.json')
 
         self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json',
                                    gpus='0')
+        # 若使用 cpu 训练，需要继续修改 configs.Run 中的内容
         # self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json')
 
-        self.dataset_cfg = datasets.functional.common.more(configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/datasets/TUS_subject.json'))
+        self.dataset_cfg = datasets.functional.common.more(configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/datasets/TUS_jagged_subject.json'))
 
         self._init()
         self._get_component()
@@ -198,8 +199,8 @@ def run():
     main = Main()
     main.split()
 
-    if main.start_epoch == 0:
-        main.val_test(main.start_epoch)
+    # if main.start_epoch == 0:
+    #     main.val_test(main.start_epoch)
     for epoch in range(main.start_epoch + 1, main.run_cfg.epochs + 1):
         main.train(epoch)
         if epoch % main.run_cfg.save_step == 0:

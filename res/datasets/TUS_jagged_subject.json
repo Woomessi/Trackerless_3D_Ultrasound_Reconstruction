@@ -1,5 +1,5 @@
 {
-  "name": "TUS_subject",
+  "name": "TUS_jagged_subject",
   "paths": {
     "h5":    "data/frames_transfs",
     "calib": "data/calib_matrix.csv"

@@ -1,0 +1,6 @@
+{
+  "name": "Online_Jagged_Backbone",
+  "weight_motion": 0.1,
+  "weight_smooth": 0.1,
+  "down_ratio": 0.1
+}

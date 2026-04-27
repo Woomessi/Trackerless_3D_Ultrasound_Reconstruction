@@ -1,0 +1,9 @@
+{
+  "name": "Online_My_Framework",
+  "backbone_weight": "./save/online_baseline_bk-hp_bk-TUS_subject/online_baseline_bk_backbone_5.pth",
+
+  "down_ratio": 0.3,
+
+  "reco_rate": 0.5,
+  "weight_fcc": 0.01
+}

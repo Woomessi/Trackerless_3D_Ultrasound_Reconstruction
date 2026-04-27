@@ -1,10 +1,7 @@
 import argparse
-import glob
 import os
-import re
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -19,9 +16,9 @@ import utils
 class Main(object):
 
     def __init__(self):
-        self.model_cfg = configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_baseline_bk.json')
+        self.model_cfg = configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_my_fm.json')
 
-        self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json',
+        self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_fm.json',
                                    gpus='0')
         # self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json')
 
@@ -107,7 +104,6 @@ class Main(object):
         self.logger.info_scalars('Train Epoch: {}\t', (epoch,), loss_all)
         if epoch % self.run_cfg.save_step == 0:
             self.model.save(epoch)
-            self.plot_loss_curve()
 
     def test(self, epoch, data_loader=None, log_text=None):
         utils.common.set_seed(int(time.time()) + epoch)
@@ -139,58 +135,6 @@ class Main(object):
     def val_test(self, epoch):
         self.test(epoch, data_loader=self.val_loader, log_text='Val')
         self.test(epoch, data_loader=self.test_loader, log_text='Test')
-
-    def plot_loss_curve(self):
-        pattern = os.path.join(self.path, self.model.name + '_*' + configs.env.paths.loss_file)
-        files = sorted(
-            glob.glob(pattern),
-            key=lambda p: int(re.search(r'_(\d+)_loss\.npy$', p).group(1))
-        )
-        if not files:
-            return
-
-        epochs, loss_data = [], {}
-        for fpath in files:
-            m = re.search(r'_(\d+)_loss\.npy$', fpath)
-            if m is None:
-                continue
-            epoch = int(m.group(1))
-            data = np.load(fpath, allow_pickle=True).item()
-            count = np.array(data.pop('_count', None) or [1.0], dtype=np.float32)
-            count_sum = count.sum()
-            epochs.append(epoch)
-            for key, val in data.items():
-                val = np.array(val, dtype=np.float32).flatten()
-                scalar = float(np.dot(count[:len(val)], val[:len(count)]) / count_sum)
-                loss_data.setdefault(key, []).append(scalar)
-
-        if not epochs:
-            return
-
-        keys = [k for k in loss_data if k != 'loss']
-        n = len(keys) + 1
-        ncols = min(n, 3)
-        nrows = (n + ncols - 1) // ncols
-
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
-        axes_flat = axes.flatten()
-
-        for i, key in enumerate(['loss'] + keys):
-            ax = axes_flat[i]
-            ax.plot(epochs, loss_data[key], marker='o', markersize=3)
-            ax.set_title(key)
-            ax.set_xlabel('Epoch')
-            ax.grid(True)
-
-        for j in range(n, len(axes_flat)):
-            axes_flat[j].set_visible(False)
-
-        fig.suptitle('Training Loss Curves', fontsize=14)
-        plt.tight_layout()
-        save_path = os.path.join(self.path, 'loss_curve.png')
-        plt.savefig(save_path, dpi=120)
-        plt.close(fig)
-        self.logger.info('Loss curve saved to {}'.format(save_path))
 
 
 def run():

@@ -84,14 +84,7 @@ def add_series_rects(plotter, series, indices=None, colors=None,
             pts = np.array([c[3], c[2], c[0], c[1]], dtype=np.float32
                            ).reshape(2, 2, 3)
             grid = pv.StructuredGrid(pts[:, :, 0], pts[:, :, 1], pts[:, :, 2])
-            # Explicitly anchor: ll→(s=0,t=0), lr→(s=1,t=0), ul→(s=0,t=1)
-            # This matches the vertically-flipped rgb where rgb[0] = original bottom row (far-field / "lower").
-            grid.texture_map_to_plane(
-                origin=c[0].astype(np.float64),   # ll
-                point_u=c[1].astype(np.float64),  # lr
-                point_v=c[3].astype(np.float64),  # ul
-                inplace=True,
-            )
+            grid.texture_map_to_plane(inplace=True)
             plotter.add_mesh(grid, texture=tex, opacity=opacity,
                              show_edges=False)
         else:

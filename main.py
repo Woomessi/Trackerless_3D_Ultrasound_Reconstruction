@@ -1,10 +1,7 @@
 import argparse
-import glob
 import os
-import re
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -13,19 +10,18 @@ import datasets
 import models
 import utils
 
-# from utils.loader import Dataset
-
 
 class Main(object):
 
-    def __init__(self):
-        self.model_cfg = configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_baseline_bk.json')
-
-        self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json',
-                                   gpus='0')
-        # self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json')
-
-        self.dataset_cfg = datasets.functional.common.more(configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/datasets/TUS_subject.json'))
+    def __init__(self, args):
+        self.args = args
+        self.model_cfg = configs.BaseConfig(utils.common.real_config_path(
+            args.model_config_path, configs.env.paths.model_cfgs_folder))
+        self.run_cfg = configs.Run(utils.common.real_config_path(
+            args.run_config_path, configs.env.paths.run_cfgs_folder), gpus=args.gpus)
+        self.dataset_cfg = datasets.functional.common.more(configs.BaseConfig(
+            utils.common.real_config_path(args.dataset_config_path, configs.env.paths.dataset_cfgs_folder)))
+        print(args)
 
         self._init()
         self._get_component()
@@ -42,7 +38,7 @@ class Main(object):
         self.dataset = datasets.functional.common.find(self.dataset_cfg.name)(self.dataset_cfg, logger=self.logger)
         self.model = models.functional.common.find(self.model_cfg.name)(
             self.model_cfg, self.dataset.cfg, self.run_cfg, dataset=self.dataset, logger=self.logger, main_msg=self.msg)
-        self.start_epoch = self.model.load(None)
+        self.start_epoch = self.model.load(self.args.test_epoch)
 
     def show_cfgs(self):
         self.logger.info(self.model.cfg)
@@ -107,7 +103,6 @@ class Main(object):
         self.logger.info_scalars('Train Epoch: {}\t', (epoch,), loss_all)
         if epoch % self.run_cfg.save_step == 0:
             self.model.save(epoch)
-            self.plot_loss_curve()
 
     def test(self, epoch, data_loader=None, log_text=None):
         utils.common.set_seed(int(time.time()) + epoch)
@@ -140,70 +135,32 @@ class Main(object):
         self.test(epoch, data_loader=self.val_loader, log_text='Val')
         self.test(epoch, data_loader=self.test_loader, log_text='Test')
 
-    def plot_loss_curve(self):
-        pattern = os.path.join(self.path, self.model.name + '_*' + configs.env.paths.loss_file)
-        files = sorted(
-            glob.glob(pattern),
-            key=lambda p: int(re.search(r'_(\d+)_loss\.npy$', p).group(1))
-        )
-        if not files:
-            return
-
-        epochs, loss_data = [], {}
-        for fpath in files:
-            m = re.search(r'_(\d+)_loss\.npy$', fpath)
-            if m is None:
-                continue
-            epoch = int(m.group(1))
-            data = np.load(fpath, allow_pickle=True).item()
-            count = np.array(data.pop('_count', None) or [1.0], dtype=np.float32)
-            count_sum = count.sum()
-            epochs.append(epoch)
-            for key, val in data.items():
-                val = np.array(val, dtype=np.float32).flatten()
-                scalar = float(np.dot(count[:len(val)], val[:len(count)]) / count_sum)
-                loss_data.setdefault(key, []).append(scalar)
-
-        if not epochs:
-            return
-
-        keys = [k for k in loss_data if k != 'loss']
-        n = len(keys) + 1
-        ncols = min(n, 3)
-        nrows = (n + ncols - 1) // ncols
-
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
-        axes_flat = axes.flatten()
-
-        for i, key in enumerate(['loss'] + keys):
-            ax = axes_flat[i]
-            ax.plot(epochs, loss_data[key], marker='o', markersize=3)
-            ax.set_title(key)
-            ax.set_xlabel('Epoch')
-            ax.grid(True)
-
-        for j in range(n, len(axes_flat)):
-            axes_flat[j].set_visible(False)
-
-        fig.suptitle('Training Loss Curves', fontsize=14)
-        plt.tight_layout()
-        save_path = os.path.join(self.path, 'loss_curve.png')
-        plt.savefig(save_path, dpi=120)
-        plt.close(fig)
-        self.logger.info('Loss curve saved to {}'.format(save_path))
-
 
 def run():
+    parser = argparse.ArgumentParser(description='RecON')
+    parser.add_argument('-m', '--model_config_path', type=str, required=True, metavar='/path/to/model/config.json',
+                        help='Path to model config .json file')
+    parser.add_argument('-r', '--run_config_path', type=str, required=True, metavar='/path/to/run/config.json',
+                        help='Path to run config .json file')
+    parser.add_argument('-d', '--dataset_config_path', type=str, required=True, metavar='/path/to/dataset/config.json',
+                        help='Path to dataset config .json file')
+    parser.add_argument('-g', '--gpus', type=str, default='0', metavar='cuda device, i.e. 0 or cpu',
+                        help='cuda device, i.e. 0 or cpu')
+    parser.add_argument('-t', '--test_epoch', type=int, metavar='epoch want to test', help='epoch want to test')
+    args = parser.parse_args()
 
-    main = Main()
+    main = Main(args)
     main.split()
+    if args.test_epoch is None:
+        if main.start_epoch == 0:
+            main.val_test(main.start_epoch)
+        for epoch in range(main.start_epoch + 1, main.run_cfg.epochs + 1):
+            main.train(epoch)
+            if epoch % main.run_cfg.save_step == 0:
+                main.val_test(epoch)
+    else:
+        main.test(main.start_epoch)
 
-    if main.start_epoch == 0:
-        main.val_test(main.start_epoch)
-    for epoch in range(main.start_epoch + 1, main.run_cfg.epochs + 1):
-        main.train(epoch)
-        if epoch % main.run_cfg.save_step == 0:
-            main.val_test(epoch)
 
 if __name__ == '__main__':
     run()

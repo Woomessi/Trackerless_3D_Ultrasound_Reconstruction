@@ -3,7 +3,7 @@
   "backbone_weight": "./save/online_bk-hp_bk-LHPerL/online_bk_backbone_1.pth",
   "discriminator_weight": "./save/online_d-hp_d-LHPerL/online_d_discriminator_1.pth",
   "discriminator_opt_cycle": 5,
-  "down_ratio": 0.3,
+  "down_ratio": 1,
   "psc_epoch": 3,
   "psc_threshold": 0.4,
   "psc_max_acquisition": 20,
