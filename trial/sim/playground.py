@@ -1,0 +1,501 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+import h5py
+import numpy as np
+import torch.nn.functional as F
+import pyvista as pv
+import matplotlib.pyplot as plt
+import trial.my_utils.functions as my_utils
+from utils.plot_functions import (
+    data_pairs_adjacent, transform_t2t, read_calib_matrices,
+)
+from utils.reconstruction import reco
+from scipy.interpolate import CubicSpline
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+class ProbeSurface:
+    """Quadratic-cross-section swept surface parameterized by
+    s ∈ [0, 1]  (left boundary → contact centre at 0.5 → right boundary) and
+    t ∈ [0, 1]  (first valid frame → last valid frame).
+
+    The two boundary curves arc_vox_left_top (s=0) and arc_vox_right_top (s=1)
+    are hard constraints; contact_vox (s=0.5) is the third interpolation knot
+    that makes the cross-section quadratic instead of linear.
+
+    Public API
+    ----------
+    evaluate(s, t) -> np.ndarray (..., 3)   point on surface
+    normal(s, t)   -> np.ndarray (..., 3)   unit normal  (∂S/∂s × ∂S/∂t)
+    """
+
+    def __init__(self, left_top, contact, right_top):
+        valid  = ~np.isnan(left_top[:, 0])
+        idx    = np.where(valid)[0].astype(float)
+        t_norm = (idx - idx[0]) / (idx[-1] - idx[0])   # map frame index → [0,1]
+        self._spl_L = CubicSpline(t_norm, left_top[valid])
+        self._spl_C = CubicSpline(t_norm, contact[valid])
+        self._spl_R = CubicSpline(t_norm, right_top[valid])
+
+    @staticmethod
+    def _basis(s):
+        """Lagrange quadratic basis through s={0, 0.5, 1} and their derivatives."""
+        s    = np.asarray(s, dtype=float)
+        B_L  = 2*s**2 - 3*s + 1;  dB_L = 4*s - 3   # s=0 → 1,  s=0.5 → 0,  s=1 → 0
+        B_C  = -4*s**2 + 4*s;     dB_C = -8*s + 4   # s=0 → 0,  s=0.5 → 1,  s=1 → 0
+        B_R  = 2*s**2 - s;        dB_R = 4*s - 1    # s=0 → 0,  s=0.5 → 0,  s=1 → 1
+        return B_L, B_C, B_R, dB_L, dB_C, dB_R
+
+    def evaluate(self, s, t):
+        """Point on the surface.  s, t may be scalars or broadcastable arrays."""
+        s, t = np.broadcast_arrays(np.asarray(s, float), np.asarray(t, float))
+        B_L, B_C, B_R, *_ = self._basis(s)
+        L = self._spl_L(t); C = self._spl_C(t); R = self._spl_R(t)
+        return B_L[..., None]*L + B_C[..., None]*C + B_R[..., None]*R
+
+    def normal(self, s, t):
+        """Unit outward normal, computed analytically from ∂S/∂s × ∂S/∂t."""
+        s, t = np.broadcast_arrays(np.asarray(s, float), np.asarray(t, float))
+        B_L, B_C, B_R, dB_L, dB_C, dB_R = self._basis(s)
+        L  = self._spl_L(t);    C  = self._spl_C(t);    R  = self._spl_R(t)
+        dL = self._spl_L(t, 1); dC = self._spl_C(t, 1); dR = self._spl_R(t, 1)
+        dS_ds = dB_L[..., None]*L  + dB_C[..., None]*C  + dB_R[..., None]*R
+        dS_dt =  B_L[..., None]*dL +  B_C[..., None]*dC +  B_R[..., None]*dR
+        n     = np.cross(dS_ds, dS_dt)
+        norm  = np.linalg.norm(n, axis=-1, keepdims=True)
+        norm  = np.where(norm < 1e-12, 1.0, norm)
+        return n / norm
+
+DATA_DIR       = '/home/wu/Documents/projects/cloned_repositories/RecON/datasets'
+FILENAME_CALIB = '/home/wu/Documents/projects/cloned_repositories/RecON/datasets/calib_matrix.csv'
+
+# ── Load data ──────────────────────────────────────────────────────────────────
+with h5py.File(os.path.join(DATA_DIR, "LH_Per_L_DtP.h5"), 'r') as f:
+    example_scan           = f["frames"][()]   # (N, H, W) uint8
+    example_transformation = f["tforms"][()]   # (N, 4, 4) float32
+
+# with h5py.File("/home/wu/Documents/projects/cloned_repositories/RecON/data/frames_transfs/005/RH_Per_S_PtD.h5", 'r') as f:
+#     example_scan           = f["frames"][()]   # (N, H, W) uint8
+#     example_transformation = f["tforms"][()]   # (N, 4, 4) float32
+
+H_img, W_img = example_scan.shape[1], example_scan.shape[2]
+
+# ── Compute T_combined: pixel [u,v,0,1] → world mm ────────────────────────────
+data_pairs = data_pairs_adjacent(example_scan.shape[0])
+tforms_each_frame2frame0 = transform_t2t(
+    torch.from_numpy(example_transformation),
+    torch.linalg.inv(torch.from_numpy(example_transformation)),
+    data_pairs,
+)
+tform_calib_scale, tform_calib_R_T, tform_calib = read_calib_matrices(FILENAME_CALIB)
+tform_calib_inv_R_T = torch.linalg.inv(tform_calib_R_T)
+
+T_combined = torch.matmul(
+    tform_calib_inv_R_T.unsqueeze(0),
+    torch.matmul(tforms_each_frame2frame0, tform_calib.unsqueeze(0)),
+)  # (N, 4, 4)
+
+# ── Build series (N, 3, 3): [centre, lower-left, lower-right] in world mm ─────
+# T_combined[i]: pixel [u, v, 0, 1] → world mm
+#   centre      pixel: (W/2, H/2, 0, 1)
+#   lower-left  pixel: (1,   H,   0, 1)
+#   lower-right pixel: (W,   H,   0, 1)
+# Note: series is in world mm.  source is downsampled so that 1 pixel ≈ 1 mm,
+# making reco() consistent with the mm-unit series without any mat_scale.
+#
+pixel_pts = torch.tensor(
+    [
+        [W_img / 2.0,  H_img / 2.0, 0.0, 1.0],   # centre
+        [1.0,          float(H_img), 0.0, 1.0],   # lower-left
+        [float(W_img), float(H_img), 0.0, 1.0],   # lower-right
+    ],
+    dtype=T_combined.dtype,
+).T  # (4, 3)
+
+N = T_combined.shape[0]
+world_pts = torch.bmm(T_combined, pixel_pts.unsqueeze(0).expand(N, 4, 3))  # (N, 4, 3)
+series = world_pts[:, :3, :].permute(0, 2, 1)  # (N, 3, 3)
+
+# ── Extract topmost arc endpoints (fan-shaped: narrow at top) ─────────────────
+# For each frame find the topmost non-zero row, then take its leftmost and
+# rightmost non-zero pixel and project to world mm via T_combined.
+arc_world_left      = np.full((N, 3), np.nan, dtype=np.float32)
+arc_world_right     = np.full((N, 3), np.nan, dtype=np.float32)
+arc_world_left_top  = np.full((N, 3), np.nan, dtype=np.float32)  # translated to v=0
+arc_world_right_top = np.full((N, 3), np.nan, dtype=np.float32)
+arc_pixels          = []   # [(i, u_left, u_right, v), ...]
+for i in range(N):
+    frame   = example_scan[i]                         # (H, W) uint8
+    nz_rows = np.where(frame.any(axis=1))[0]
+    if len(nz_rows) == 0:
+        continue
+    top_v   = int(nz_rows[0])
+    nz_cols = np.where(frame[top_v] > 0)[0]
+    u_left, u_right = float(nz_cols[0]), float(nz_cols[-1])
+    arc_pixels.append((i, u_left, u_right, float(top_v)))
+    for u_val, arr_arc, arr_top in [
+        (u_left,  arc_world_left,  arc_world_left_top),
+        (u_right, arc_world_right, arc_world_right_top),
+    ]:
+        # arc endpoint at actual topmost row
+        pix = torch.tensor([u_val, float(top_v), 0.0, 1.0], dtype=T_combined.dtype)
+        w   = (T_combined[i] @ pix.unsqueeze(-1)).squeeze(-1)
+        arr_arc[i] = w[:3].numpy()
+        # same u, translated up to v=0 (top frame boundary) → collinear with contact_vox
+        pix_top = torch.tensor([u_val, 0.0, 0.0, 1.0], dtype=T_combined.dtype)
+        w_top   = (T_combined[i] @ pix_top.unsqueeze(-1)).squeeze(-1)
+        arr_top[i] = w_top[:3].numpy()
+
+print(f"Extracted arc endpoints for {len(arc_pixels)} frames")
+print(f"Frame 0: top_row={int(arc_pixels[0][3])}, u_left={arc_pixels[0][1]:.0f}, u_right={arc_pixels[0][2]:.0f}")
+print(f"  world_left[0]       = {arc_world_left[0]}")
+print(f"  world_left_top[0]   = {arc_world_left_top[0]}")
+print(f"  world_right_top[0]  = {arc_world_right_top[0]}")
+
+# ── Prepare source frames: (N, H, W) float32 in [0, 1] ────────────────────────
+source = torch.from_numpy(example_scan.astype(np.float32) / 255.0)  # (N, H, W)
+
+# ── Downsample ──────────────────────────────────
+
+down_ratio = 1
+mat_scale = torch.eye(4, dtype=torch.float32, device=DEVICE)
+mat_scale[0, 0] = down_ratio
+mat_scale[1, 1] = down_ratio
+mat_scale[2, 2] = down_ratio
+
+source_down = F.interpolate(
+    source.unsqueeze(1), scale_factor=down_ratio, mode='bilinear', align_corners=False
+).squeeze(1)  # (N, H*dr, W*dr)
+
+scale_w = float(tform_calib_scale[0, 0])  # u → W dimension
+scale_h = float(tform_calib_scale[1, 1])  # v → H dimension
+
+# ── Reconstruct 3-D volume ─────────────────────────────────────────────────────
+
+volume, bias = my_utils.reco(source_down.to(DEVICE), series.to(DEVICE), scale_w, scale_h, mat_scale)
+# volume, bias = my_utils.reco(source.to(DEVICE), series.to(DEVICE), scale_w, scale_h)
+
+volume = volume.cpu()
+
+# ── 3D volume rendering with PyVista ──────────────────────────────────────────
+vol_np = volume.numpy()
+grid = pv.ImageData()
+grid.dimensions = np.array(vol_np.shape)
+grid.spacing = (1, 1, 1)
+grid.point_data["Intensity"] = vol_np.flatten(order="F")
+
+plotter = pv.Plotter(title="3D US reconstruction")
+plotter.add_volume(grid, scalars="Intensity", cmap="bone", opacity="sigmoid")
+
+# ── World coordinate frame (origin + X/Y/Z axes) ──────────────────────────────
+# voxel = world_mm - bias  →  world origin in PyVista space is at -bias
+bias_np = bias.cpu().numpy()
+world_origin_v = (-bias_np).tolist()
+axis_len = max(vol_np.shape) * 0.15
+
+plotter.add_mesh(
+    pv.Sphere(radius=axis_len * 0.06, center=world_origin_v),
+    color="white",
+)
+for direction, color, label in [
+    ([1, 0, 0], "red",   "X"),
+    ([0, 1, 0], "green", "Y"),
+    ([0, 0, 1], "blue",  "Z"),
+]:
+    d = np.array(direction, dtype=float)
+    plotter.add_mesh(
+        pv.Arrow(start=world_origin_v, direction=d, scale=axis_len,
+                 tip_length=0.25, tip_radius=0.10, shaft_radius=0.04),
+        color=color,
+    )
+    plotter.add_point_labels(
+        [(-bias_np + d * axis_len * 1.15).tolist()],
+        [label],
+        font_size=16,
+        text_color=color,
+        always_visible=True,
+        shape=None,
+        show_points=False,
+    )
+
+# ── Visualise example_transformation: frame planes + probe trajectory ──────────
+stride = 50  # one frame outline per this many frames
+
+# 4 image-corner pixels (columns = homogeneous points [u, v, 0, 1]^T)
+corners_pix = torch.tensor(
+    [
+        [0.0,          0.0,          0.0, 1.0],  # upper-left
+        [float(W_img), 0.0,          0.0, 1.0],  # upper-right
+        [float(W_img), float(H_img), 0.0, 1.0],  # lower-right
+        [0.0,          float(H_img), 0.0, 1.0],  # lower-left
+    ],
+    dtype=T_combined.dtype,
+).T  # (4, 4)
+
+corners_world = torch.bmm(
+    T_combined, corners_pix.unsqueeze(0).expand(N, -1, -1)
+)  # (N, 4, 4)
+bias_t = torch.from_numpy(bias_np)
+corners_vox = (
+    corners_world[:, :3, :].permute(0, 2, 1) - bias_t  # (N, 4, 3) voxel space
+).numpy()
+centers_vox = (series[:, 0, :] - bias_t).numpy()  # (N, 3)
+
+# Arc top-edge endpoints in voxel space
+arc_vox_left      = arc_world_left      - bias_np  # (N, 3)
+arc_vox_right     = arc_world_right     - bias_np  # (N, 3)
+arc_vox_left_top  = arc_world_left_top  - bias_np  # (N, 3)  v=0 boundary
+arc_vox_right_top = arc_world_right_top - bias_np  # (N, 3)
+
+# # Probe-centre trajectory (yellow polyline)
+# traj_poly = pv.PolyData()
+# traj_poly.points = centers_vox
+# traj_poly.lines = np.hstack([[N], np.arange(N)])
+# plotter.add_mesh(traj_poly, color="yellow", line_width=2)
+
+# example_transformation stores the tracker-sensor pose; it does NOT directly
+# encode the probe-skin contact point.  The contact point is the top-centre of
+# the image plane (v = 0, near-field / transducer face), which requires the
+# calibration matrix to reach world mm:
+#   P_contact = T_combined @ [W/2, 0, 0, 1]^T
+contact_pix   = torch.tensor([W_img / 2.0, 0.0, 0.0, 1.0], dtype=T_combined.dtype)
+contact_world = (T_combined @ contact_pix.unsqueeze(-1)).squeeze(-1)  # (N, 4)
+contact_vox   = (contact_world[:, :3] - bias_t).numpy()               # (N, 3)
+probe_surface = ProbeSurface(arc_vox_left_top, contact_vox, arc_vox_right_top)
+
+# Contact-point trajectory (magenta) — distinct from the centre trajectory
+contact_traj        = pv.PolyData()
+contact_traj.points = contact_vox
+contact_traj.lines  = np.hstack([[N], np.arange(N)])
+plotter.add_mesh(contact_traj, color="magenta", line_width=2)
+
+# # Arc top-edge endpoints at actual topmost row: left = cyan, right = orange
+# valid = ~np.isnan(arc_vox_left[:, 0])
+# plotter.add_points(arc_vox_left[valid],  color="cyan",   point_size=6, render_points_as_spheres=True)
+# plotter.add_points(arc_vox_right[valid], color="orange", point_size=6, render_points_as_spheres=True)
+
+# Same endpoints translated to v=0 (frame top boundary, collinear with contact_vox):
+# left = deep sky blue, right = gold
+valid_top = ~np.isnan(arc_vox_left_top[:, 0])
+plotter.add_points(arc_vox_left_top[valid_top],  color="deepskyblue", point_size=8, render_points_as_spheres=True)
+plotter.add_points(arc_vox_right_top[valid_top], color="gold",        point_size=8, render_points_as_spheres=True)
+
+# Fitted bounded contact surface (left/right boundaries are hard constraints)
+_ns, _nt = 40, 120
+_SS, _TT = np.meshgrid(np.linspace(0, 1, _ns), np.linspace(0, 1, _nt))  # (_nt, _ns)
+_pts     = probe_surface.evaluate(_SS, _TT)                               # (_nt, _ns, 3)
+surf_mesh = pv.StructuredGrid(_pts[..., 0], _pts[..., 1], _pts[..., 2])
+plotter.add_mesh(surf_mesh, color="cyan", opacity=0.35, show_edges=False)
+
+# Probe rotation axes (columns of T_combined's rotation block, normalised):
+#   col 0 = u-axis (image width / lateral)  → red
+#   col 1 = v-axis (image depth / axial)    → green
+#   col 2 = normal (out-of-plane / elevational) → blue
+rot_cols  = T_combined[:, :3, :3]
+axis_dirs = (rot_cols / rot_cols.norm(dim=1, keepdim=True)).numpy()  # (N, 3, 3)
+probe_axis_len = float(max(vol_np.shape)) * 0.05
+
+# First and last frame: yellow outline + textured US image
+# corners order: UL(0), UR(1), LR(2), LL(3)
+# UV: UL→(0,1), UR→(1,1), LR→(1,0), LL→(0,0)  [VTK: t=0 bottom, t=1 top]
+# corners order: UL(0), UR(1), LR(2), LL(3)
+# UL/UR: pixel v=0 (near-field)  → numpy row 0 → VTK t=0
+# LL/LR: pixel v=H (far-field)   → numpy row H → VTK t=1
+uv_coords = np.array([[0., 1.], [1., 1.], [1., 0.], [0., 0.]], dtype=np.float32)
+
+for i in [0, N - 1]:
+    pts = corners_vox[i]
+    quad = pv.PolyData()
+    quad.points = pts
+    quad.lines = np.array([2, 0, 1, 2, 1, 2, 2, 2, 3, 2, 3, 0])
+    plotter.add_mesh(quad, color="yellow", line_width=2, opacity=0.9)
+
+    img_gray = example_scan[i]                                       # (H, W) uint8
+    img_rgb  = np.stack([img_gray, img_gray, img_gray], axis=-1)     # (H, W, 3) uint8
+    tex      = pv.Texture(img_rgb)
+
+    quad_tex = pv.PolyData()
+    quad_tex.points = pts
+    quad_tex.faces  = np.array([4, 0, 1, 2, 3])
+    quad_tex.active_texture_coordinates = uv_coords
+    plotter.add_mesh(quad_tex, texture=tex, opacity=0.85)
+
+for i in range(0, N, stride):
+    # Probe pose axes at the contact point (v=0 top-centre of image)
+    origin = contact_vox[i]
+    for j, ax_color in enumerate(["red", "green", "blue"]):
+        plotter.add_mesh(
+            pv.Arrow(
+                start=origin,
+                direction=axis_dirs[i, :, j],
+                scale=probe_axis_len,
+                tip_length=0.25,
+                tip_radius=0.05,
+                shaft_radius=0.01,
+            ),
+            color=ax_color,
+        )
+
+# ─── Interactive slice on surf_mesh ──────────────────────────────────────────
+# Controls:  ↑ / ↓   → move origin along t  (sweep / frame direction)
+#            ← / →   → move origin along s  (cross-section direction)
+#            space   → rotate ax_x around surface normal (y-axis)  by 15°
+
+S_STEP     = 0.02
+T_STEP     = 0.02
+ANGLE_STEP = np.pi / 12     # 15° per space press
+
+state = {'s': 0.5, 't': 0.5, 'angle': 0.0}
+_slice_actors = []           # live PyVista actors replaced on every update
+
+volume_up = F.interpolate(
+    volume.unsqueeze(0).unsqueeze(0), scale_factor=1.0 / down_ratio
+).squeeze(0).squeeze(0)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _ax_x_ref(s, t):
+    """Unit s-tangent of probe_surface (projected onto tangent plane).
+    Serves as the zero-rotation reference for ax_x."""
+    B_L, B_C, B_R, dB_L, dB_C, dB_R = ProbeSurface._basis(float(s))
+    L  = probe_surface._spl_L(float(t))
+    Cm = probe_surface._spl_C(float(t))
+    R  = probe_surface._spl_R(float(t))
+    dS_ds = dB_L * L + dB_C * Cm + dB_R * R   # (3,) tangent in s-direction
+    n     = probe_surface.normal(s, t)          # (3,) unit normal
+    ref   = dS_ds - n * np.dot(n, dS_ds)        # project onto tangent plane
+    nrm   = np.linalg.norm(ref)
+    if nrm < 1e-12:                             # degenerate: fall back
+        ref = np.array([1., 0., 0.]) - n * n[0]
+        nrm = np.linalg.norm(ref)
+    return (ref / nrm).astype(np.float32)
+
+def _rotate_around(v, axis, angle):
+    """Rodrigues: rotate v (perpendicular to unit axis) around axis by angle."""
+    ca, sa = float(np.cos(angle)), float(np.sin(angle))
+    return (ca * v + sa * np.cross(axis, v)).astype(np.float32)
+
+# ── Live 2-D matplotlib window ────────────────────────────────────────────────
+plt.ion()
+_fig2d, _ax2d = plt.subplots(figsize=(4, 3))
+_img_hdl = _ax2d.imshow(
+    np.zeros((H_img, W_img), dtype=np.float32), cmap="gray", vmin=0, vmax=1
+)
+_ax2d.axis("off")
+_fig2d.tight_layout()
+
+# ── Core update ───────────────────────────────────────────────────────────────
+def _update():
+    s, t, angle = state['s'], state['t'], state['angle']
+
+    origin_np = probe_surface.evaluate(s, t).astype(np.float32)   # (3,) top-edge centre of image
+    normal_np = probe_surface.normal(s, t).astype(np.float32)     # (3,) outward normal (away from tissue)
+    # ax_y_internal (get_axis convention) = normal = near-field/outward direction
+    # ax_y_display  (user convention)     = -normal = into the 3-D volume
+
+    ax_y    = torch.from_numpy(normal_np)        # ax_y_internal, used for series & transform
+    ax_x_np = _rotate_around(_ax_x_ref(s, t), normal_np, angle)
+    ax_x    = torch.from_numpy(ax_x_np)
+    origin  = torch.from_numpy(origin_np)
+
+    # True image centre: (H-1)/2 pixels below the contact/top-edge point
+    center = origin - ax_y * (H_img - 1) / 2.0 * scale_h
+
+    # series (1,3,3): get_axis recovers ax_x = LR-LL, ax_y = 2C-LR-LL  (both normalised)
+    slicer_vox = torch.stack([
+        center,
+        center - ax_x - ax_y,     # lower-left  (far-field, left)
+        center + ax_x - ax_y,     # lower-right (far-field, right)
+    ], dim=0).unsqueeze(0)
+
+    sim_slice = my_utils.get_slice(
+        volume_up, slicer_vox, source.shape[-2:], scale_h=scale_h, scale_w=scale_w
+    ).squeeze(0, 1, 2)            # (H_img, W_img)
+
+    # ── 2-D window ────────────────────────────────────────────────────────────
+    _img_hdl.set_data(sim_slice.numpy())
+    _ax2d.set_title(f"s={s:.3f}  t={t:.3f}  θ={np.degrees(angle):.1f}°", fontsize=9)
+    _fig2d.canvas.draw_idle()
+    _fig2d.canvas.flush_events()
+
+    # ── 3-D scene ─────────────────────────────────────────────────────────────
+    for a in _slice_actors:
+        plotter.remove_actor(a)
+    _slice_actors.clear()
+
+    # Corner positions, with origin = top-edge centre (h=0, w=W/2):
+    #   vox(h, w) = origin + ax_x*(w-(W-1)/2)*sw - ax_y*h*sh
+    def _corner(h, w):
+        return (origin + ax_x * (w - (W_img - 1) / 2.0) * scale_w
+                       - ax_y * h * scale_h).numpy()
+
+    ul = _corner(0,         0        )   # upper-left  (near-field, left)
+    ur = _corner(0,         W_img - 1)   # upper-right (near-field, right)
+    lr = _corner(H_img - 1, W_img - 1)   # lower-right (far-field,  right)
+    ll = _corner(H_img - 1, 0        )   # lower-left  (far-field,  left)
+    corners = np.stack([ul, ur, lr, ll])
+
+    # Outline
+    _ol        = pv.PolyData()
+    _ol.points = corners
+    _ol.lines  = np.array([2, 0, 1, 2, 1, 2, 2, 2, 3, 2, 3, 0])
+    _slice_actors.append(plotter.add_mesh(_ol, color="lime", line_width=3))
+
+    # Textured quad (VTK t=0 → bottom/far-field, t=1 → top/near-field)
+    _u8  = (sim_slice.numpy() * 255).clip(0, 255).astype(np.uint8)
+    _tex = pv.Texture(np.stack([_u8] * 3, axis=-1))
+    _q   = pv.PolyData()
+    _q.points = corners
+    _q.faces  = np.array([4, 0, 1, 2, 3])
+    _q.active_texture_coordinates = np.array(
+        [[0., 1.], [1., 1.], [1., 0.], [0., 0.]], dtype=np.float32
+    )
+    _slice_actors.append(plotter.add_mesh(_q, texture=_tex, opacity=0.85))
+
+    # Origin sphere
+    _slice_actors.append(
+        plotter.add_mesh(pv.Sphere(radius=axis_len * 0.04, center=origin_np.tolist()),
+                         color="lime")
+    )
+    # Local axes: x = red, y = -normal (into volume) = limegreen
+    for _d, _clr in [(ax_x_np, "red"), (-normal_np, "limegreen")]:
+        _slice_actors.append(
+            plotter.add_mesh(
+                pv.Arrow(start=origin_np, direction=_d, scale=axis_len * 0.5,
+                         tip_length=0.25, tip_radius=0.05, shaft_radius=0.02),
+                color=_clr,
+            )
+        )
+
+    plotter.render()
+
+_update()   # initial draw
+
+# ── Key bindings ──────────────────────────────────────────────────────────────
+def _on_up():
+    state['t'] = max(0.0, state['t'] - T_STEP);  _update()
+
+def _on_down():
+    state['t'] = min(1.0, state['t'] + T_STEP);  _update()
+
+def _on_left():
+    state['s'] = max(0.0, state['s'] - S_STEP);  _update()
+
+def _on_right():
+    state['s'] = min(1.0, state['s'] + S_STEP);  _update()
+
+def _on_space():
+    state['angle'] += ANGLE_STEP;  _update()
+
+plotter.add_key_event("Up",    _on_up)
+plotter.add_key_event("Down",  _on_down)
+plotter.add_key_event("Left",  _on_left)
+plotter.add_key_event("Right", _on_right)
+plotter.add_key_event("space", _on_space)
+
+plotter.show_axes()
+plotter.set_background("black")
+plotter.show()
