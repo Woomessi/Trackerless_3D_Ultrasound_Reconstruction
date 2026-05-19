@@ -29,10 +29,10 @@ import torch.nn.functional as F
 import h5py
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# H5_PATH    = "../../data/frames_transfs/001/LH_Per_L_DtP.h5"
-H5_PATH    = "../../data/frames_transfs/002/LH_Par_L_PtD.h5"
+H5_PATH    = "/media/wu/Extreme SSD/datasets/11178509/train_part1/023/LH_Par_L_PtD.h5"
+# H5_PATH    = "../../data/frames_transfs/002/LH_Par_L_PtD.h5"
 CALIB_PATH = "../../data/calib_matrix.csv"
-CKPT_PATH  = "../../save/online_jagged_bk-hp_bk-TUS_jagged_subject/online_jagged_bk_backbone_10.pth"
+CKPT_PATH  = "../../save/online_baseline_bk-hp_bk-TUS_complete/online_baseline_bk_backbone_230.pth"
 OUT_DIR    = "../../infer_baseline_output"
 
 # ── Model config (must match training) ────────────────────────────────────────
@@ -303,6 +303,16 @@ def _add_quads(ax, series, color, alpha=0.25, step=50):
         ax.add_collection3d(poly)
 
 
+def _set_axes_equal_3d(ax):
+    """Force equal aspect ratio on a 3D axes by expanding shorter axes to match the longest."""
+    limits = np.array([ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()])
+    centers = limits.mean(axis=1)
+    half_range = (limits[:, 1] - limits[:, 0]).max() / 2.0
+    ax.set_xlim3d(centers[0] - half_range, centers[0] + half_range)
+    ax.set_ylim3d(centers[1] - half_range, centers[1] + half_range)
+    ax.set_zlim3d(centers[2] - half_range, centers[2] + half_range)
+
+
 def visualize(gt, pred, out_dir):
     """
     gt, pred : (N, 3, 3) numpy arrays
@@ -343,6 +353,7 @@ def visualize(gt, pred, out_dir):
         ax.set_zlabel('Z (mm)', labelpad=4)
         ax.set_title(title, fontsize=10)
         ax.view_init(elev=elev, azim=azim)
+        _set_axes_equal_3d(ax)
 
         if col == 0:
             ax.legend(handles=[

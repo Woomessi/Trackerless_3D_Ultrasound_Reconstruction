@@ -1,8 +1,8 @@
 """
-trial/sim/example_env.py  –  ProbeEnv basic usage examples.
+trial/sim/gym_env.py  –  ProbeEnv basic usage examples.
 
 Run from the RecON repository root:
-    python trial/sim/example_env.py
+    python trial/sim/gym_env.py
 """
 
 import sys
