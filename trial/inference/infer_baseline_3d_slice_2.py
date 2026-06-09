@@ -18,7 +18,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import matplotlib
-matplotlib.use('Agg')
+# matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -27,22 +27,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import h5py
-
+import trial.my_utils.functions as my_utils
+import pyvista as pv
+from utils.plot_functions import (
+    data_pairs_adjacent, transform_t2t, read_calib_matrices, add_series_rects,
+)
 # ── Paths ─────────────────────────────────────────────────────────────────────
-H5_PATH    = "/media/wu/Extreme SSD/datasets/11178509/train_part1/021/LH_Par_L_PtD.h5"
+# H5_PATH    = "/media/wu/Extreme SSD/datasets/11178509/train_part1/001/LH_Par_L_PtD.h5"
 # H5_PATH    = "../../data/frames_transfs/002/LH_Par_L_PtD.h5"
-# H5_PATH     = "../../data/frames_transfs/001/LH_Per_L_DtP.h5"
+H5_PATH     = "../../data/frames_transfs/001/LH_Per_L_DtP.h5"
 CALIB_PATH = "../../data/calib_matrix.csv"
-# CKPT_PATH  = "../../save/online_baseline_bk-hp_bk-TUS_complete/online_baseline_bk_backbone_230.pth"
-CKPT_PATH  = "../../save/online_finetune_bk_cpu-hp_finetune_bk-TUS_complete_scan/online_finetune_bk_cpu_backbone_10.pth"
+CKPT_PATH  = "../../save/online_baseline_bk-hp_bk-TUS_complete/online_baseline_bk_backbone_230.pth"
 OUT_DIR    = "../../infer_baseline_output"
+FILENAME_CALIB = '/home/wu/Documents/projects/cloned_repositories/RecON/datasets/calib_matrix.csv'
 
 # ── Model config (must match training) ────────────────────────────────────────
 IN_PLANES   = 2   # two consecutive frames (channel=2)
 NUM_CLASSES = 6   # target.elements(15) - 9 = 6 gaps (tx,ty,tz,rx,ry,rz)
 IMG_H, IMG_W = 480, 640
 BATCH_PAIRS  = 1  # number of frame-pairs to process at once (memory budget)
-
+down_ratio = 1
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -211,8 +215,51 @@ def main():
     with h5py.File(H5_PATH, 'r') as f:
         frames_np = f['frames'][()]    # (N, H_orig, W_orig) uint8
         tforms_np = f['tforms'][()]    # (N, 4, 4) float32
+
+    H, W = frames_np.shape[1], frames_np.shape[2]
     N, H_orig, W_orig = frames_np.shape
     print(f"  frames: {frames_np.shape}, tforms: {tforms_np.shape}")
+
+    source_0 = frames_np
+
+    ######################################################
+    ### Compute T_combined: pixel [u,v,0,1] → world mm ###
+    ######################################################
+
+    data_pairs = data_pairs_adjacent(frames_np.shape[0])
+    T_each_frame2frame0 = transform_t2t(
+        torch.from_numpy(tforms_np),
+        torch.linalg.inv(torch.from_numpy(tforms_np)),
+        data_pairs,
+    )
+
+    T_calib_scale, T_calib_R_T, T_calib = read_calib_matrices(FILENAME_CALIB)
+    T_calib_inv_R_T = torch.linalg.inv(T_calib_R_T)
+
+    scale_w = float(T_calib_scale[0, 0])  # u → W dimension
+    scale_h = float(T_calib_scale[1, 1])  # v → H dimension
+
+    T_combined = torch.matmul(
+        T_calib_inv_R_T.unsqueeze(0),
+        torch.matmul(T_each_frame2frame0, T_calib.unsqueeze(0)),
+    )  # (N, 4, 4)
+
+    #############################################################################
+    ### Build series (N, 3, 3): [centre, lower-left, lower-right] in world mm ###
+    #############################################################################
+
+    pixel_pts = torch.tensor(
+        [
+            [W / 2.0, H / 2.0, 0.0, 1.0],  # centre
+            [1.0, float(H), 0.0, 1.0],  # lower-left
+            [float(W), float(H), 0.0, 1.0],  # lower-right
+        ],
+        dtype=T_combined.dtype,
+    ).T  # (4, 3)
+
+    N = T_combined.shape[0]
+    world_pts = torch.bmm(T_combined, pixel_pts.unsqueeze(0).expand(N, 4, 3))  # (N, 4, 3)
+    series = world_pts[:, :3, :].permute(0, 2, 1)  # (N, 3, 3)
 
     # 2. Build ground-truth series ─────────────────────────────────────────────
     print("Building GT series from calibration ...")
@@ -266,23 +313,157 @@ def main():
     )                                                          # (N, 3, 3)
     print(f"  predicted series shape: {pred_series.shape}")
 
-    # 8. Save outputs ──────────────────────────────────────────────────────────
-    np.save(os.path.join(OUT_DIR, "predicted_gaps.npy"),   fake_gaps.numpy())
-    np.save(os.path.join(OUT_DIR, "predicted_series.npy"), pred_series.numpy())
-    np.save(os.path.join(OUT_DIR, "gt_series.npy"),        gt_series.numpy())
-    print(f"\nResults saved to '{OUT_DIR}/':")
-    print(f"  predicted_gaps.npy   {fake_gaps.shape}  (tx,ty,tz,rx,ry,rz per pair)")
-    print(f"  predicted_series.npy {pred_series.shape}  (world-mm frame positions)")
-    print(f"  gt_series.npy        {gt_series.shape}  (ground-truth)")
+    scale_w = float(T_calib_scale[0, 0])  # u → W dimension
+    scale_h = float(T_calib_scale[1, 1])  # v → H dimension
 
-    # 9. Quick sanity stats ────────────────────────────────────────────────────
-    dist_err = torch.norm(
-        pred_series[:, 0, :] - gt_series[:, 0, :], dim=-1
-    ).mean().item()
-    print(f"\nMean center-point distance error: {dist_err:.4f} mm")
+    ##################
+    ### Downsample ###
+    ##################
 
-    # 10. Visualize ────────────────────────────────────────────────────────────
-    visualize(gt_series.numpy(), pred_series.numpy(), OUT_DIR)
+    source_0 = torch.from_numpy(source_0.astype(np.float32) / 255.0)  # (N, H, W)
+
+    mat_scale = torch.eye(4, dtype=torch.float32, device=device)
+    mat_scale[0, 0] = down_ratio
+    mat_scale[1, 1] = down_ratio
+    mat_scale[2, 2] = down_ratio
+
+    source_down = F.interpolate(
+        source_0.unsqueeze(1), scale_factor=down_ratio, mode='bilinear', align_corners=False
+    ).squeeze(1)  # (N, H*dr, W*dr)
+
+    ##############################
+    ### Reconstruct 3-D volume ###
+    ##############################
+    volume, bias = my_utils.reco(source_down.to(device), pred_series.to(device), scale_w, scale_h, mat_scale)
+    # volume, bias = my_utils.reco(source_down.to(device), series.to(device), scale_w, scale_h, mat_scale)
+
+    volume = volume.cpu()
+    bias = bias.cpu()
+
+    series_biased = series - bias
+    volume_up = F.interpolate(volume.unsqueeze(0).unsqueeze(0), scale_factor=1 / down_ratio).squeeze(0).squeeze(0)
+
+    ########################
+    ### Slice 3-D volume ###
+    ### Out-of-plane rotation: transverse → longitudinal
+    ########################
+    idx_start_point = 300
+    s = series[idx_start_point]   # (3, 3): [center, lower-left, lower-right]
+    C  = s[0]
+    LL = s[1]
+    LR = s[2]
+    UL = 2 * C - LR  # upper-left (from rectangle symmetry)
+
+    # Frame basis vectors
+    e_x_raw = LR - LL
+    w_size   = torch.norm(e_x_raw)
+    e_x      = e_x_raw / w_size       # horizontal axis (left → right)
+    w_half   = w_size / 2
+
+    h_vec  = UL - LL                  # = 2*C - LR - LL
+    h_size = torch.norm(h_vec)
+    e_y    = h_vec / h_size           # vertical axis (bottom → top / depth)
+    h_half = h_size / 2
+
+    e_z = torch.linalg.cross(e_x, e_y)   # out-of-plane normal
+
+    # Rotate around the width axis e_x by a fixed angle
+    theta = torch.tensor(torch.pi / 4)
+    new_e_y = torch.cos(theta) * e_y + torch.sin(theta) * e_z
+    LL_new  = C - w_half * e_x - h_half * new_e_y
+    LR_new  = C + w_half * e_x - h_half * new_e_y
+
+    rotated_series = torch.stack([C, LL_new, LR_new]).unsqueeze(0)  # (1, 3, 3)
+    rotated_slicer_biased = rotated_series - bias          # align with volume coords
+
+    # Get slices from the 3D volume for all rotated frames at once
+    rot_slices = my_utils.get_slice(
+        volume_up,
+        rotated_slicer_biased,
+        source.shape[-2:],
+        scale_h=scale_h,
+        scale_w=scale_w,
+    )  # (1, n_steps, 1, H, W)
+    rot_slices = rot_slices.squeeze(0, 2).cpu()            # (n_steps, H, W)
+
+    ########################
+    ### Visualise slices ###
+    ########################
+    deg_label = f"{int(round(theta.item() * 180 / torch.pi))}°"
+
+    fig, axes = plt.subplots(1, 2, figsize=(5, 3), squeeze=False)
+    fig.suptitle(f"Out-of-plane rotation: {deg_label}")
+
+    orig = source_0[idx_start_point]
+    axes[0, 0].imshow(orig, cmap="gray", vmin=0, vmax=1)
+    axes[0, 0].set_title("original frame", fontsize=8)
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(rot_slices[0], cmap="gray", vmin=0, vmax=1)
+    axes[0, 1].set_title(deg_label, fontsize=8)
+    axes[0, 1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    ########################################
+    ### 3D volume rendering with PyVista ###
+    ########################################
+    plotter = pv.Plotter(title='Out-of-plane rotation: transverse → longitudinal')
+
+    vol_np = volume_up.numpy()
+    grid = pv.ImageData()
+    grid.dimensions = np.array(vol_np.shape)
+    grid.spacing = (1, 1, 1)
+    grid.point_data["Intensity"] = vol_np.flatten(order="F")
+    plotter.add_volume(grid, scalars="Intensity", cmap="bone", opacity="sigmoid")
+
+    # 0°  = transverse frame (red), 90° = longitudinal frame (blue)
+    add_series_rects(plotter, rotated_slicer_biased[0:1],  indices=[0], colors='red',  opacity=1)
+    add_series_rects(plotter, rotated_slicer_biased[-1:],  indices=[0], colors='blue', opacity=1)
+
+    plotter.show_axes()
+    plotter.set_background('black')
+    plotter.show()
+
+    # ########################################
+    # ### 3D volume rendering with PyVista ###
+    # ########################################
+    #
+    # plotter = pv.Plotter(title='Series rectangles')
+    #
+    # vol_np = volume_up.numpy()
+    # grid = pv.ImageData()
+    # grid.dimensions = np.array(vol_np.shape)
+    # grid.spacing = (1, 1, 1)
+    # grid.point_data["Intensity"] = vol_np.flatten(order="F")
+    # plotter.add_volume(grid, scalars="Intensity", cmap="bone", opacity="sigmoid")
+    #
+    # # add_series_rects(plotter, series_biased, indices=[0, 300, N - 1], colors='red', opacity=1, frames=source)
+    # # add_series_rects(plotter, slicer_biased, indices=[0], colors='blue', opacity=1)
+    #
+    # plotter.show_axes()
+    # plotter.set_background('black')
+    # plotter.show()
+
+    #
+    # # 8. Save outputs ──────────────────────────────────────────────────────────
+    # np.save(os.path.join(OUT_DIR, "predicted_gaps.npy"),   fake_gaps.numpy())
+    # np.save(os.path.join(OUT_DIR, "predicted_series.npy"), pred_series.numpy())
+    # np.save(os.path.join(OUT_DIR, "gt_series.npy"),        gt_series.numpy())
+    # print(f"\nResults saved to '{OUT_DIR}/':")
+    # print(f"  predicted_gaps.npy   {fake_gaps.shape}  (tx,ty,tz,rx,ry,rz per pair)")
+    # print(f"  predicted_series.npy {pred_series.shape}  (world-mm frame positions)")
+    # print(f"  gt_series.npy        {gt_series.shape}  (ground-truth)")
+    #
+    # # 9. Quick sanity stats ────────────────────────────────────────────────────
+    # dist_err = torch.norm(
+    #     pred_series[:, 0, :] - gt_series[:, 0, :], dim=-1
+    # ).mean().item()
+    # print(f"\nMean center-point distance error: {dist_err:.4f} mm")
+    #
+    # # 10. Visualize ────────────────────────────────────────────────────────────
+    # visualize(gt_series.numpy(), pred_series.numpy(), OUT_DIR)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -110,7 +110,7 @@ idx_start_point = 300
 start_point = series[idx_start_point].unsqueeze(0)
 dof = torch.tensor([
     [
-        [0., 0., 0., 1., 0., 0.]
+        [0., 0., 0., 0., 0., 0.]
     ]
 ])
 

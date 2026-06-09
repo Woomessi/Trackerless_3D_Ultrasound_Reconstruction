@@ -1,0 +1,11 @@
+{
+  "name": "hp_finetune_bk",
+  "batch_size": 1,
+  "test_batch_size": 1,
+  "epochs": 100,
+  "save_step": 1,
+  "lr": 4e-6,
+  "betas": [0.9, 0.99],
+  "step_size": 5,
+  "gamma": 0.5
+}
