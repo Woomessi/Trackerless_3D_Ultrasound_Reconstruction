@@ -29,14 +29,14 @@ import torch
 import torch.nn.functional as F
 
 import configs
-import datasets
 import utils
+from datasets.BaseDataset import BaseDataset
 from utils.plot_functions import data_pairs_adjacent, transform_t2t, read_calib_matrices
 
 __all__ = ['TUS_complete_scan']
 
 
-class TUS_complete_scan(datasets.BaseDataset):
+class TUS_complete_scan(BaseDataset):
 
     # ------------------------------------------------------------------
     # Configuration
