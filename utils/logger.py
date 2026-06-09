@@ -1,6 +1,5 @@
 import logging
 import os
-import platform
 
 import numpy as np
 
@@ -20,10 +19,8 @@ class Logger(object):
     def _mkfile(self):
         if not os.path.exists(self.path):
             os.makedirs(self.path)
-        if platform.system() == 'Windows':
-            open(self.logging_file, 'a')
-        else:
-            not os.path.exists(self.logging_file) and os.mknod(self.logging_file)
+        if not os.path.exists(self.logging_file):
+            open(self.logging_file, 'a').close()
 
     def _setlogger(self):
         global _utils_logger
