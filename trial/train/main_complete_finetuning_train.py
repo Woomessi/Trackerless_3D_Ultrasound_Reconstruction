@@ -50,7 +50,7 @@ class Main(object):
 
     def __init__(self):
         self.model_cfg = configs.BaseConfig(
-            os.path.join(_PROJ_ROOT, 'res/models/online_finetune_bk.json')
+            os.path.join(_PROJ_ROOT, 'res/models/online_finetune_bk_cpu.json')
         )
         self.run_cfg = configs.Run(
             os.path.join(_PROJ_ROOT, 'res/run/hp_finetune_bk.json'),
