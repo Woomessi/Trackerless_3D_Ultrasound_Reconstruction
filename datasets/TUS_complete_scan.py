@@ -112,7 +112,6 @@ class TUS_complete_scan(BaseDataset):
 
     def load(self):
         root   = self.cfg.paths.h5
-        H_out, W_out = self.cfg.source.height, self.cfg.source.width
 
         subjects = sorted([
             d for d in os.listdir(root)
@@ -139,26 +138,15 @@ class TUS_complete_scan(BaseDataset):
             for subs in split_subjects
         ]
 
-        scan_list = []   # ordered: all train scans, then val, then test
-
+        # Only store paths — no h5 I/O during init to avoid Drive FUSE
+        # caching all 600 × 150 MB files to local disk before training starts.
+        # Geometry (series_norm, target_dof, target_point) is computed lazily
+        # on first __getitem__ access and cached in-memory thereafter.
+        scan_list = []
         for files in split_files:
             for h5_path in files:
-                with h5py.File(h5_path, 'r') as f:
-                    tforms_np = f['tforms'][()]    # (N, 4, 4) float32
-                    n_frames  = f['frames'].shape[0]
+                scan_list.append({'path': h5_path})
 
-                series = self._build_series(tforms_np, H_out, W_out)  # (N, 3, 3)
-                series_norm, target_dof, target_point = self._normalise_series(series)
-
-                scan_list.append({
-                    'path':         h5_path,
-                    'n_frames':     n_frames,
-                    'series_norm':  series_norm,    # (N, 3, 3)  normalised GT
-                    'target_dof':   target_dof,     # (N-1, 6)
-                    'target_point': target_point,   # (N, 9)
-                })
-
-        # Update train_test_range to actual scan counts
         self.cfg.train_test_range = [
             len(split_files[0]), len(split_files[1]), len(split_files[2])
         ]
@@ -178,9 +166,21 @@ class TUS_complete_scan(BaseDataset):
 
         H_out, W_out = self.cfg.source.height, self.cfg.source.width
 
-        # ── Load all frames from disk ──────────────────────────────────
+        need_geometry = 'series_norm' not in scan
+
+        # ── Load frames; also load tforms on first access for this scan ──
         with h5py.File(scan['path'], 'r') as f:
             frames_np = f['frames'][()]          # (N, H_orig, W_orig) uint8
+            if need_geometry:
+                tforms_np = f['tforms'][()]      # (N, 4, 4) float32
+
+        # ── Lazy-compute and cache geometry ───────────────────────────
+        if need_geometry:
+            series = self._build_series(tforms_np, H_out, W_out)
+            series_norm, target_dof, target_point = self._normalise_series(series)
+            scan['series_norm']  = series_norm
+            scan['target_dof']   = target_dof
+            scan['target_point'] = target_point
 
         source = torch.from_numpy(frames_np.astype(np.float32) / 255.0)  # (N, H, W)
         H_orig, W_orig = source.shape[1], source.shape[2]
