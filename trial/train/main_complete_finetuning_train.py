@@ -20,7 +20,15 @@ Configs  : res/models/online_finetune_bk.json
 import glob
 import os
 import re
+import sys
 import time
+
+# Ensure the project root (two levels up from this script) is on sys.path so
+# that `import configs`, `import datasets`, etc. work when the script is run
+# directly (e.g. `python trial/train/main_complete_finetuning_train.py`).
+_PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _PROJ_ROOT not in sys.path:
+    sys.path.insert(0, _PROJ_ROOT)
 
 # Must be set before any CUDA memory is allocated (i.e. before `import torch`
 # initialises the CUDA context).  expandable_segments lets the allocator grow
@@ -42,16 +50,16 @@ class Main(object):
 
     def __init__(self):
         self.model_cfg = configs.BaseConfig(
-            '/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_finetune_bk.json'
+            os.path.join(_PROJ_ROOT, 'res/models/online_finetune_bk.json')
         )
         self.run_cfg = configs.Run(
-            '/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_finetune_bk.json',
+            os.path.join(_PROJ_ROOT, 'res/run/hp_finetune_bk.json'),
             gpus='0'
         )
         # Complete-scan dataset: each __getitem__ returns all N frames of one scan
         self.dataset_cfg = datasets.functional.common.more(
             configs.BaseConfig(
-                '/home/wu/Documents/projects/cloned_repositories/RecON/res/datasets/TUS_complete_scan.json'
+                os.path.join(_PROJ_ROOT, 'res/datasets/TUS_complete_scan.json')
             )
         )
 
