@@ -8,5 +8,10 @@
   "dense_grad": true,
   "backbone_input_scale": 1,
   "grad_clip_norm": 0.5,
-  "max_reco_voxels": 500000000
+  "max_reco_voxels": 500000000,
+
+  "weight_loss1":       0.6,
+  "weight_loss_rot":    0.4,
+  "weight_loss_jagged": 0.0,
+  "weight_loss_ssim":   0.0
 }
