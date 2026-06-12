@@ -49,13 +49,6 @@ max_train_frames       int    maximum frames per training window (default 64)
                               if the scan has more frames a random contiguous
                               window of this length is chosen each step
 backbone_chunk_size    int    pairs per backbone forward chunk (default 8)
-backbone_input_scale   float  spatial downscale applied to frames BEFORE the
-                              backbone (default 0.5).  Does NOT affect the
-                              frames used for reco() or _find_intersecting_frame.
-                              EfficientNet-B1 backward peak at 480×640:
-                                  scale=1.0 → 6040 MB  (OOM on 8 GB GPU)
-                                  scale=0.5 → 1672 MB  ✓
-                                  scale=0.25→  550 MB  ✓
 down_ratio             float  spatial downscale factor for reco() (default 1.0)
 
 # Loss 1 — slice–real-image similarity
@@ -84,15 +77,7 @@ dense_grad             bool   enable dense gradients through voxel intensities
                               This provides a much richer training signal but
                               stores the full reco() computation graph, which
                               can be 5–20× larger than the sparse-grad path.
-                              _reconstruct_volume automatically wraps reco()
-                              in gradient checkpointing when dense_grad=True,
-                              so reco intermediates are recomputed during
-                              backward rather than stored.  This prevents the
-                              OOM caused by the reco graph and backbone
-                              recomputation coexisting in GPU memory during
-                              backward, and eliminates progressive fragmentation
-                              from differently-sized reco graphs across scans.
-                              Additional recommended mitigations:
+                              Recommended memory mitigations when enabling:
                                   down_ratio         0.25 – 0.5
                                   max_train_frames   16 – 32
                                   criterion_scale    0.25 – 0.5
@@ -143,7 +128,7 @@ class Online_Finetuning_Backbone(models.BaseModel):
         super().__init__(cfg, data_cfg, run, **kwargs)
 
         # ── Backbone ──────────────────────────────────────────────────
-        self.backbone = models.online_baseline_backbone.Backbone(
+        self.backbone = models.backup.online_baseline_backbone.Backbone(
             self.data_cfg.source.channel,
             self.data_cfg.target.elements - 9,
         ).to(self.device)
@@ -183,27 +168,9 @@ class Online_Finetuning_Backbone(models.BaseModel):
         # are randomly windowed.  Set to 0 or None to use the full scan.
         self.max_train_frames    = int(getattr(self.cfg, 'max_train_frames', 64) or 0)
 
-        # ── Gradient clipping ──────────────────────────────────────────
-        # reco()'s _get_weight uses softmax(w / T=0.001) whose Jacobian has
-        # magnitude ~1/T = 1000, which causes gradient explosion without
-        # clipping.  grad_clip_norm caps the L2 norm of all backbone
-        # parameter gradients before each optimizer.step().
-        # Set to 0 to disable clipping (not recommended with dense_grad=True).
-        self.grad_clip_norm = float(getattr(self.cfg, 'grad_clip_norm', 1.0) or 0.0)
-
         # ── Scan context (populated by train(), consumed by custom_criterion) ──
         # Holds the full-scan tensors and the current training-window index set.
         self._scan_ctx: dict = {}
-
-        # ── Consistent loss-key tracking ──────────────────────────────────────
-        # train() must return the same set of keys for every scan so that
-        # BaseModel.train_return_hook can align _count (one entry per scan)
-        # with each per-scan loss value via dot product.
-        # Initialized to ['loss_slice'] (the base custom_criterion output);
-        # updated after the first successful criterion call so that subclasses
-        # returning a different set of keys (e.g. extra regularisation terms)
-        # are also handled correctly.
-        self._component_loss_keys: list = ['loss_slice', 'grad_norm']
 
     # ------------------------------------------------------------------
     # 3-D reconstruction helper
@@ -240,42 +207,16 @@ class Online_Finetuning_Backbone(models.BaseModel):
                                   detached when enable_grad=False,
                                   has gradient through series when enable_grad=True
         """
-        def _body(source_, series_):
-            # source_ and series_ are explicit args so that grad_ckpt can
-            # identify which tensors need gradient tracking during recompute.
-            # Non-tensor attributes (scale_w, scale_h, mat_scale, down_ratio)
-            # are captured from self via closure — that is safe.
-
-            # ── Volume-size guard ─────────────────────────────────────────
-            # A degenerate predicted trajectory (e.g. accumulated backbone
-            # errors early in fine-tuning) can produce a bounding box whose
-            # voxel count overflows torch's 32-bit numel limit (~2.1 B),
-            # raising "RuntimeError: numel: integer multiplication overflow"
-            # inside reco()'s torch.meshgrid call.
-            # Pre-checking with get_reco_size is cheap (no GPU allocation)
-            # and lets train() catch the error and retry with a new window.
-            reco_size_chk, _ = my_utils.get_reco_size(series_, self.mat_scale)
-            n_voxels = 1
-            for s in reco_size_chk:
-                n_voxels *= int(s)
-            max_voxels = int(getattr(self.cfg, 'max_reco_voxels', 500_000_000))
-            if n_voxels > max_voxels:
-                raise ValueError(
-                    f'Predicted volume too large: {n_voxels:,} voxels '
-                    f'(reco_size={[int(s) for s in reco_size_chk]}, '
-                    f'max={max_voxels:,}). '
-                    f'Trajectory is likely degenerate; will retry.'
-                )
-
+        def _body():
             source_down = F.interpolate(
-                source_,
+                source,
                 scale_factor=self.down_ratio,
                 mode='bilinear',
                 align_corners=False,
             ).squeeze(1)                   # (N, H·dr, W·dr)
 
             volume, bias = my_utils.reco(
-                source_down, series_,
+                source_down, series,
                 self.scale_w, self.scale_h,
                 self.mat_scale,
             )
@@ -289,23 +230,10 @@ class Online_Finetuning_Backbone(models.BaseModel):
             return volume, bias
 
         if enable_grad:
-            # Gradient checkpointing for reco() is critical when dense_grad=True.
-            #
-            # Without it, reco() stores its full computation graph (proportional
-            # to N × H × W × volume_size) throughout the entire backward pass.
-            # When backbone gradient checkpointing then RECOMPUTES backbone
-            # activations (in the same backward call), both graphs must coexist
-            # in GPU memory simultaneously — causing OOM on typical GPUs.
-            #
-            # With checkpointing: reco() intermediates are discarded after
-            # forward and recomputed on-demand during backward, so they are
-            # freed before backbone recomputation begins.  This also eliminates
-            # the progressive memory fragmentation from repeated alloc/free of
-            # differently-sized reco graphs across scans.
-            return grad_ckpt(_body, source, series, use_reentrant=False)
+            return _body()
         else:
             with torch.no_grad():
-                return _body(source, series)
+                return _body()
 
     # ------------------------------------------------------------------
     # Backbone inference
@@ -327,36 +255,17 @@ class Online_Finetuning_Backbone(models.BaseModel):
 
         Returns:
             fake_gaps  (N-1, 6)  predicted gaps [tx,ty,tz, rx,ry,rz] (descaled)
-
-        Memory note — backbone_input_scale
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        EfficientNet-B1 backward on (chunk_size, 2, 480, 640) requires ~6 GB
-        of intermediate activations, which exceeds a 7.6 GB GPU when combined
-        with source_full and optimizer states.  backbone_input_scale (default
-        0.5) downsamples frames to (chunk_size, 2, 240, 320) before the
-        backbone, cutting backward peak from 6040 MB → 1672 MB.  The reco()
-        call and _find_intersecting_frame always use the original 480×640
-        frames, so reconstruction quality is unaffected.
         """
         N = source.shape[0]
-
-        # Spatial downscale for backbone input only.
-        # reco() uses the original-resolution source; only the backbone sees
-        # the downsampled version.
-        bb_scale = float(getattr(self.cfg, 'backbone_input_scale', 0.5))
-
         chunk_outputs = []
 
         for start in range(0, N - 1, self.backbone_chunk_size):
             end = min(start + self.backbone_chunk_size, N - 1)
 
             # Build pair chunk on-the-fly to avoid allocating the full pairs tensor
-            s0 = source[start:end]           # (k, 1, H, W)
-            s1 = source[start + 1:end + 1]  # (k, 1, H, W)
-            if bb_scale != 1.0:
-                s0 = F.interpolate(s0, scale_factor=bb_scale, mode='bilinear', align_corners=False)
-                s1 = F.interpolate(s1, scale_factor=bb_scale, mode='bilinear', align_corners=False)
-            chunk = torch.cat([s0, s1], dim=1).unsqueeze(0)   # (1, k, 2, H_s, W_s)
+            chunk = torch.cat(
+                [source[start:end], source[start + 1:end + 1]], dim=1
+            ).unsqueeze(0)                 # (1, k, 2, H, W)
 
             if use_checkpoint:
                 # Recompute activations during backward — saves ~90 % of backbone memory
@@ -983,19 +892,11 @@ class Online_Finetuning_Backbone(models.BaseModel):
             # dense_grad=False: reco() runs under no_grad → gradient flows
             #                   only through the bounding-box origin (bias)
             dense_grad = bool(getattr(self.cfg, 'dense_grad', False))
-            try:
-                volume, bias = self._reconstruct_volume(
-                    source.detach().clone(),
-                    fake_series if dense_grad else fake_series.detach(),
-                    enable_grad=dense_grad,
-                )                                                           # (D,H',W'), (3,)
-            except (ValueError, RuntimeError) as _reco_err:
-                # Degenerate trajectory: either the pre-check raised ValueError
-                # (too many voxels) or meshgrid raised RuntimeError (overflow).
-                # Discard this window and let the retry loop pick a new one.
-                del fake_gaps, fake_series
-                torch.cuda.empty_cache()
-                continue
+            volume, bias = self._reconstruct_volume(
+                source.detach(),
+                fake_series if dense_grad else fake_series.detach(),
+                enable_grad=dense_grad,
+            )                                                               # (D,H',W'), (3,)
 
             # # ╔══════════════════════════════════════════════════════════════════╗
             # # ║  DEBUG: 3-D volume visualisation — comment out for training     ║
@@ -1011,30 +912,6 @@ class Online_Finetuning_Backbone(models.BaseModel):
             # ── 4. Self-supervised loss (retry if no intersection) ────────
             losses = self.custom_criterion(source, fake_gaps, fake_series, volume, bias)
             if losses is not None:
-                # Record the component keys so that failed scans can return
-                # zeros for the same keys, keeping _count aligned with every
-                # loss value in loss_all for BaseModel.train_return_hook.
-                self._component_loss_keys = list(losses.keys()) + ['grad_norm']
-
-                # ── Pre-backward memory release ───────────────────────────
-                # source_full (N_full × 1 × H × W, ~700 MB for long scans)
-                # is no longer needed: _find_intersecting_frame has already
-                # completed inside custom_criterion.  We free it here — before
-                # loss.backward() — to give the CUDA allocator ~700 MB of
-                # headroom for the reco() recomputation that grad_ckpt triggers
-                # during backward.
-                #
-                # Why .clone() above matters:
-                #   source.detach() shares storage with source_full (view).
-                #   Without .clone(), the checkpoint would hold a reference
-                #   to that shared storage, keeping all 700 MB alive even
-                #   after we delete source and source_full here.
-                #   source.detach().clone() gives the checkpoint an independent
-                #   19 MB copy, so deleting source + source_full below truly
-                #   releases the 700 MB before backward.
-                del source, source_full
-                self._scan_ctx.clear()
-                torch.cuda.empty_cache()
                 break   # valid window found; exit retry loop
 
             # No qualifying frame found — release GPU tensors before the next
@@ -1045,65 +922,14 @@ class Online_Finetuning_Backbone(models.BaseModel):
 
         if losses is None:
             # All window re-sampling attempts failed; skip gradient step.
-            # Still clear the scan context so source_full is released now
-            # rather than persisting until the next call to train().
-            self._scan_ctx.clear()
-            torch.cuda.empty_cache()
-            # Return zeros for ALL component loss keys so that every scan
-            # contributes exactly one entry to each key in loss_all.
-            # BaseModel.train_return_hook does `_count @ value / _count_sum`
-            # which requires len(_count) == len(value) for every key.
-            # Returning only {'loss': 0.0} while successful scans also include
-            # 'loss_slice' (and any other custom_criterion keys) would cause
-            # a "inconsistent tensor size" RuntimeError at epoch end.
-            zero = torch.tensor(0.0, device=self.device)
-            return {'loss': zero, **{k: zero for k in self._component_loss_keys}}
+            return {'loss': torch.tensor(0.0, device=self.device)}
 
         loss = sum(losses.values())
         loss.backward()
-
-        # ── Gradient clipping ─────────────────────────────────────────────
-        # reco()'s _get_weight contains softmax(w / T=0.001) whose gradient
-        # has magnitude ~1/T = 1000×, causing gradient explosion without
-        # clipping.  clip_grad_norm_ returns the UNCLIPPED total norm so we
-        # can monitor it; it only modifies gradients when the norm exceeds
-        # grad_clip_norm (default 1.0).  Set cfg.grad_clip_norm=0 to disable.
-        if self.grad_clip_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.backbone.parameters(),
-                max_norm=self.grad_clip_norm,
-            )
-        else:
-            # Compute norm for monitoring without modifying gradients
-            grad_norm = torch.sqrt(torch.stack([
-                p.grad.detach().norm() ** 2
-                for p in self.backbone.parameters()
-                if p.grad is not None
-            ]).sum())
-
         self.optimizer.step()
         self.scheduler.step(epoch_info['epoch'])
 
-        ret = {
-            'loss':      loss.detach(),
-            'grad_norm': grad_norm.detach(),
-            **{k: v.detach() for k, v in losses.items()},
-        }
-
-        # ── Inter-scan GPU memory cleanup ─────────────────────────────────
-        # source / source_full were already released in the pre-backward
-        # block above (del source, source_full + _scan_ctx.clear()), so
-        # _scan_ctx.clear() here is a no-op.  It is kept for safety in case
-        # a future code path reaches this point without having cleared it.
-        # The remaining gradient-related tensors are explicitly deleted so
-        # PyTorch can reclaim their slabs before the next scan allocates its
-        # own source_full (~700 MB), preventing the brief double-allocation
-        # window that fragments the CUDA cache pool.
-        self._scan_ctx.clear()
-        del fake_gaps, fake_series, volume, bias, losses, loss
-        torch.cuda.empty_cache()
-
-        return ret
+        return {'loss': loss.detach(), **{k: v.detach() for k, v in losses.items()}}
 
     # ------------------------------------------------------------------
     # Test step — full scan, no gradient tracking

@@ -207,7 +207,7 @@ class Online_Finetuning_Backbone(models.BaseModel):
         super().__init__(cfg, data_cfg, run, **kwargs)
 
         # ── Backbone ──────────────────────────────────────────────────
-        self.backbone = models.online_baseline_backbone.Backbone(
+        self.backbone = models.backup.online_baseline_backbone.Backbone(
             self.data_cfg.source.channel,
             self.data_cfg.target.elements - 9,
         ).to(self.device)
@@ -267,7 +267,27 @@ class Online_Finetuning_Backbone(models.BaseModel):
         # updated after the first successful criterion call so that subclasses
         # returning a different set of keys (e.g. extra regularisation terms)
         # are also handled correctly.
-        self._component_loss_keys: list = ['loss_slice', 'grad_norm']
+        self._component_loss_keys: list = self._enabled_loss_keys()
+
+    # ------------------------------------------------------------------
+    # Loss-key helpers
+    # ------------------------------------------------------------------
+
+    def _enabled_loss_keys(self):
+        """Return the list of loss keys that will be active given the current config.
+
+        Mirrors the conditional logic in custom_criterion so that zero-return
+        dicts (failed scans) always carry the same keys as successful ones,
+        keeping _count aligned with every loss array in train_return_hook.
+        """
+        keys = ['loss_slice']
+        if float(getattr(self.cfg, 'weight_loss_rot',    0.0)) > 0:
+            keys.append('loss_rot')
+        if float(getattr(self.cfg, 'weight_loss_jagged', 0.0)) > 0:
+            keys.append('loss_jagged')
+        if float(getattr(self.cfg, 'weight_loss_ssim',   0.0)) > 0:
+            keys.append('loss_ssim')
+        return keys
 
     # ------------------------------------------------------------------
     # 3-D reconstruction helper
@@ -1543,7 +1563,7 @@ class Online_Finetuning_Backbone(models.BaseModel):
                 # Record the component keys so that failed scans can return
                 # zeros for the same keys, keeping _count aligned with every
                 # loss value in loss_all for BaseModel.train_return_hook.
-                self._component_loss_keys = list(losses.keys()) + ['grad_norm']
+                self._component_loss_keys = self._enabled_loss_keys()
 
                 # ── Pre-backward memory release ───────────────────────────
                 # source_full (N_full × 1 × H × W, ~700 MB for long scans)
@@ -1594,28 +1614,18 @@ class Online_Finetuning_Backbone(models.BaseModel):
         # ── Gradient clipping ─────────────────────────────────────────────
         # reco()'s _get_weight contains softmax(w / T=0.001) whose gradient
         # has magnitude ~1/T = 1000×, causing gradient explosion without
-        # clipping.  clip_grad_norm_ returns the UNCLIPPED total norm so we
-        # can monitor it; it only modifies gradients when the norm exceeds
-        # grad_clip_norm (default 1.0).  Set cfg.grad_clip_norm=0 to disable.
+        # clipping.  Set cfg.grad_clip_norm=0 to disable.
         if self.grad_clip_norm > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
+            torch.nn.utils.clip_grad_norm_(
                 self.backbone.parameters(),
                 max_norm=self.grad_clip_norm,
             )
-        else:
-            # Compute norm for monitoring without modifying gradients
-            grad_norm = torch.sqrt(torch.stack([
-                p.grad.detach().norm() ** 2
-                for p in self.backbone.parameters()
-                if p.grad is not None
-            ]).sum())
 
         self.optimizer.step()
         self.scheduler.step(epoch_info['epoch'])
 
         ret = {
-            'loss':      loss.detach(),
-            'grad_norm': grad_norm.detach(),
+            'loss': loss.detach(),
             **{k: v.detach() for k, v in losses.items()},
         }
 
@@ -1633,6 +1643,89 @@ class Online_Finetuning_Backbone(models.BaseModel):
         torch.cuda.empty_cache()
 
         return ret
+
+    # ------------------------------------------------------------------
+    # Eval-loss step — same forward as train() but no backward/optimizer
+    # ------------------------------------------------------------------
+
+    def eval_loss(self, epoch_info, sample_dict):
+        """Forward pass + criterion without updating weights.
+
+        Mirrors train() logic (window selection, reco, custom_criterion) but
+        runs entirely under torch.no_grad() and never calls loss.backward()
+        or optimizer.step().  Used for computing val loss curves.
+
+        Returns:
+            dict[str, Tensor]  {loss_name: detached scalar, ...}
+        """
+        source_full    = sample_dict['source'].to(self.device).squeeze(0)
+        target_full    = sample_dict['target'].to(self.device).squeeze(0)
+        gt_series_full = target_full[:, -9:].view(-1, 3, 3)
+        N_full         = source_full.shape[0]
+
+        self.backbone.eval()
+        max_reco_attempts = int(getattr(self.cfg, 'max_reco_attempts', 5))
+
+        with torch.no_grad():
+            for _attempt in range(max_reco_attempts):
+                if self.max_train_frames > 0 and N_full > self.max_train_frames:
+                    t0 = torch.randint(
+                        0, N_full - self.max_train_frames + 1, (1,)
+                    ).item()
+                    source    = source_full[t0:t0 + self.max_train_frames]
+                    gt_series = gt_series_full[t0:t0 + self.max_train_frames]
+                    window_indices_set = set(range(t0, t0 + self.max_train_frames))
+                    win_start = t0
+                else:
+                    source    = source_full
+                    gt_series = gt_series_full
+                    window_indices_set = set(range(N_full))
+                    win_start = 0
+
+                self._scan_ctx = {
+                    'source_full':        source_full,
+                    'gt_series_full':     gt_series_full,
+                    'window_indices_set': window_indices_set,
+                    'window_start':       win_start,
+                    'window_size':        source.shape[0],
+                    'epoch_info':         epoch_info,
+                }
+
+                fake_gaps = self._run_backbone(source, use_checkpoint=False)
+                fake_series = utils.simulation.dof_to_series(
+                    gt_series[0:1],
+                    fake_gaps.unsqueeze(0),
+                ).squeeze(0)
+
+                try:
+                    volume, bias = self._reconstruct_volume(
+                        source.detach().clone(),
+                        fake_series.detach(),
+                        enable_grad=False,
+                    )
+                except (ValueError, RuntimeError):
+                    del fake_gaps, fake_series
+                    torch.cuda.empty_cache()
+                    continue
+
+                losses = self.custom_criterion(source, fake_gaps, fake_series, volume, bias)
+                self._scan_ctx.clear()
+
+                if losses is not None:
+                    loss = sum(losses.values())
+                    ret  = {'loss': loss.detach(),
+                            **{k: v.detach() for k, v in losses.items()}}
+                    del fake_gaps, fake_series, volume, bias, losses, loss
+                    torch.cuda.empty_cache()
+                    return ret
+
+                del fake_gaps, fake_series, volume, bias
+                torch.cuda.empty_cache()
+
+        self._scan_ctx.clear()
+        torch.cuda.empty_cache()
+        zero = torch.tensor(0.0, device=self.device)
+        return {'loss': zero, **{k: zero for k in self._component_loss_keys}}
 
     # ------------------------------------------------------------------
     # Test step — full scan, no gradient tracking

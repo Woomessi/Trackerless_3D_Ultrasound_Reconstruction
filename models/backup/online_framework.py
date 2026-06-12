@@ -28,11 +28,11 @@ class Online_Framework(models.BaseModel):
 
     def __init__(self, cfg, data_cfg, run, **kwargs):
         super().__init__(cfg, data_cfg, run, **kwargs)
-        self.backbone = models.online_backbone.Backbone(self.data_cfg.source.channel, self.data_cfg.target.elements - 9).to(self.device)
+        self.backbone = models.backup.online_backbone.Backbone(self.data_cfg.source.channel, self.data_cfg.target.elements - 9).to(self.device)
         self.backbone_start_weight = torch.load(configs.env.getdir(self.cfg.backbone_weight))
         self.backbone.load_state_dict(self.backbone_start_weight)
 
-        self.discriminator = models.online_discriminator.Discriminator().to(self.device)
+        self.discriminator = models.backup.online_discriminator.Discriminator().to(self.device)
         self.discriminator_start_weight = torch.load(configs.env.getdir(self.cfg.discriminator_weight))
         self.discriminator.load_state_dict(self.discriminator_start_weight)
 

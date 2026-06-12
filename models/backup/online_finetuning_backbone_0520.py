@@ -21,7 +21,7 @@ class Online_Finetuning_Backbone(models.BaseModel):
 
     def __init__(self, cfg, data_cfg, run, **kwargs):
         super().__init__(cfg, data_cfg, run, **kwargs)
-        self.backbone = models.online_baseline_backbone.Backbone(
+        self.backbone = models.backup.online_baseline_backbone.Backbone(
             self.data_cfg.source.channel, self.data_cfg.target.elements - 9
         ).to(self.device)
 

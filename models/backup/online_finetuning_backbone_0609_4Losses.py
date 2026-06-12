@@ -49,6 +49,13 @@ max_train_frames       int    maximum frames per training window (default 64)
                               if the scan has more frames a random contiguous
                               window of this length is chosen each step
 backbone_chunk_size    int    pairs per backbone forward chunk (default 8)
+backbone_input_scale   float  spatial downscale applied to frames BEFORE the
+                              backbone (default 0.5).  Does NOT affect the
+                              frames used for reco() or _find_intersecting_frame.
+                              EfficientNet-B1 backward peak at 480×640:
+                                  scale=1.0 → 6040 MB  (OOM on 8 GB GPU)
+                                  scale=0.5 → 1672 MB  ✓
+                                  scale=0.25→  550 MB  ✓
 down_ratio             float  spatial downscale factor for reco() (default 1.0)
 
 # Loss 1 — slice–real-image similarity
@@ -64,6 +71,20 @@ criterion_scale        float  downsample ratio for the slice extracted in
                               resolution cuts gradient-tensor memory ~4×
                               (~12 MiB → ~3 MiB at 480×640 full resolution)
 weight_loss1           float  weight applied to loss_slice (default 1.0)
+weight_loss_rot        float  weight applied to the rotation-consistency loss
+                              (default 0.0; set > 0 to enable Loss 2)
+rotation_max_angle     float  maximum tilt angle in radians for Loss 2 / 3
+                              (default π/6 ≈ 30°)
+weight_loss_jagged     float  weight applied to the jaggedness loss on the
+                              rotated slice (default 0.0; set > 0 to enable
+                              Loss 3).  Measured as isotropic total variation
+                              of the rotated slice: TV = mean|Δrow| + mean|Δcol|
+weight_loss_ssim       float  weight applied to the adjacent-slice SSIM loss
+                              (default 0.0; set > 0 to enable Loss 4).
+                              ⚠ Gradient only when dense_grad=True.
+ssim_window_size       int    Gaussian window width for SSIM (default 11)
+ssim_num_pairs         int    adjacent slice pairs evaluated per step
+                              (-1 = all D-1 pairs, default -1)
 dense_grad             bool   enable dense gradients through voxel intensities
                               (default False).  When True, _reconstruct_volume
                               runs with gradient tracking so the backward pass
@@ -77,7 +98,15 @@ dense_grad             bool   enable dense gradients through voxel intensities
                               This provides a much richer training signal but
                               stores the full reco() computation graph, which
                               can be 5–20× larger than the sparse-grad path.
-                              Recommended memory mitigations when enabling:
+                              _reconstruct_volume automatically wraps reco()
+                              in gradient checkpointing when dense_grad=True,
+                              so reco intermediates are recomputed during
+                              backward rather than stored.  This prevents the
+                              OOM caused by the reco graph and backbone
+                              recomputation coexisting in GPU memory during
+                              backward, and eliminates progressive fragmentation
+                              from differently-sized reco graphs across scans.
+                              Additional recommended mitigations:
                                   down_ratio         0.25 – 0.5
                                   max_train_frames   16 – 32
                                   criterion_scale    0.25 – 0.5
@@ -120,6 +149,56 @@ def _ckpt_backbone_fwd(backbone, chunk):
     return out.squeeze(0)                           # (k, 6)
 
 
+# ── Module-level SSIM helpers (used by Loss 4) ────────────────────────────────
+
+def _gaussian_window(size, sigma, device, dtype):
+    """2-D separable Gaussian kernel of shape (1, 1, size, size)."""
+    coords = torch.arange(size, device=device, dtype=dtype) - size // 2
+    g = torch.exp(-coords.pow(2) / (2.0 * sigma ** 2))
+    g = g / g.sum()
+    return g.view(1, 1, size, 1) * g.view(1, 1, 1, size)   # outer product
+
+
+def _batch_ssim(x, y, window_size=11, sigma=1.5, C1=1e-4, C2=9e-4):
+    """Mean SSIM between two batches of single-channel images.
+
+    Standard SSIM formula with a Gaussian weighting window.
+    C1 = (0.01·L)², C2 = (0.03·L)² for L=1 (images in [0, 1]).
+
+    Args:
+        x, y        (N, 1, H, W)  float32 in [0, 1]
+        window_size int            Gaussian kernel width; auto-clamped to
+                                   the smaller of H and W (must be ≥ 3)
+        sigma       float          Gaussian std
+        C1, C2      float          stability constants
+
+    Returns:
+        scalar  mean SSIM in [-1, 1] over all pixels and N pairs
+    """
+    H, W = x.shape[-2], x.shape[-1]
+    ws = min(window_size, H, W)
+    if ws % 2 == 0:
+        ws -= 1
+    ws = max(ws, 3)
+    pad = ws // 2
+
+    k = _gaussian_window(ws, sigma, x.device, x.dtype)   # (1, 1, ws, ws)
+
+    mu_x  = F.conv2d(x,        k, padding=pad)
+    mu_y  = F.conv2d(y,        k, padding=pad)
+    mu_x2 = mu_x.pow(2)
+    mu_y2 = mu_y.pow(2)
+    mu_xy = mu_x * mu_y
+
+    sg_x2 = F.conv2d(x.pow(2), k, padding=pad) - mu_x2
+    sg_y2 = F.conv2d(y.pow(2), k, padding=pad) - mu_y2
+    sg_xy = F.conv2d(x * y,    k, padding=pad) - mu_xy
+
+    num   = (2.0 * mu_xy + C1) * (2.0 * sg_xy + C2)
+    denom = (mu_x2 + mu_y2 + C1) * (sg_x2 + sg_y2 + C2)
+    return (num / denom).mean()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 class Online_Finetuning_Backbone(models.BaseModel):
@@ -128,7 +207,7 @@ class Online_Finetuning_Backbone(models.BaseModel):
         super().__init__(cfg, data_cfg, run, **kwargs)
 
         # ── Backbone ──────────────────────────────────────────────────
-        self.backbone = models.online_baseline_backbone.Backbone(
+        self.backbone = models.backup.online_baseline_backbone.Backbone(
             self.data_cfg.source.channel,
             self.data_cfg.target.elements - 9,
         ).to(self.device)
@@ -168,9 +247,27 @@ class Online_Finetuning_Backbone(models.BaseModel):
         # are randomly windowed.  Set to 0 or None to use the full scan.
         self.max_train_frames    = int(getattr(self.cfg, 'max_train_frames', 64) or 0)
 
+        # ── Gradient clipping ──────────────────────────────────────────
+        # reco()'s _get_weight uses softmax(w / T=0.001) whose Jacobian has
+        # magnitude ~1/T = 1000, which causes gradient explosion without
+        # clipping.  grad_clip_norm caps the L2 norm of all backbone
+        # parameter gradients before each optimizer.step().
+        # Set to 0 to disable clipping (not recommended with dense_grad=True).
+        self.grad_clip_norm = float(getattr(self.cfg, 'grad_clip_norm', 1.0) or 0.0)
+
         # ── Scan context (populated by train(), consumed by custom_criterion) ──
         # Holds the full-scan tensors and the current training-window index set.
         self._scan_ctx: dict = {}
+
+        # ── Consistent loss-key tracking ──────────────────────────────────────
+        # train() must return the same set of keys for every scan so that
+        # BaseModel.train_return_hook can align _count (one entry per scan)
+        # with each per-scan loss value via dot product.
+        # Initialized to ['loss_slice'] (the base custom_criterion output);
+        # updated after the first successful criterion call so that subclasses
+        # returning a different set of keys (e.g. extra regularisation terms)
+        # are also handled correctly.
+        self._component_loss_keys: list = ['loss_slice', 'grad_norm']
 
     # ------------------------------------------------------------------
     # 3-D reconstruction helper
@@ -207,16 +304,42 @@ class Online_Finetuning_Backbone(models.BaseModel):
                                   detached when enable_grad=False,
                                   has gradient through series when enable_grad=True
         """
-        def _body():
+        def _body(source_, series_):
+            # source_ and series_ are explicit args so that grad_ckpt can
+            # identify which tensors need gradient tracking during recompute.
+            # Non-tensor attributes (scale_w, scale_h, mat_scale, down_ratio)
+            # are captured from self via closure — that is safe.
+
+            # ── Volume-size guard ─────────────────────────────────────────
+            # A degenerate predicted trajectory (e.g. accumulated backbone
+            # errors early in fine-tuning) can produce a bounding box whose
+            # voxel count overflows torch's 32-bit numel limit (~2.1 B),
+            # raising "RuntimeError: numel: integer multiplication overflow"
+            # inside reco()'s torch.meshgrid call.
+            # Pre-checking with get_reco_size is cheap (no GPU allocation)
+            # and lets train() catch the error and retry with a new window.
+            reco_size_chk, _ = my_utils.get_reco_size(series_, self.mat_scale)
+            n_voxels = 1
+            for s in reco_size_chk:
+                n_voxels *= int(s)
+            max_voxels = int(getattr(self.cfg, 'max_reco_voxels', 500_000_000))
+            if n_voxels > max_voxels:
+                raise ValueError(
+                    f'Predicted volume too large: {n_voxels:,} voxels '
+                    f'(reco_size={[int(s) for s in reco_size_chk]}, '
+                    f'max={max_voxels:,}). '
+                    f'Trajectory is likely degenerate; will retry.'
+                )
+
             source_down = F.interpolate(
-                source,
+                source_,
                 scale_factor=self.down_ratio,
                 mode='bilinear',
                 align_corners=False,
             ).squeeze(1)                   # (N, H·dr, W·dr)
 
             volume, bias = my_utils.reco(
-                source_down, series,
+                source_down, series_,
                 self.scale_w, self.scale_h,
                 self.mat_scale,
             )
@@ -230,10 +353,23 @@ class Online_Finetuning_Backbone(models.BaseModel):
             return volume, bias
 
         if enable_grad:
-            return _body()
+            # Gradient checkpointing for reco() is critical when dense_grad=True.
+            #
+            # Without it, reco() stores its full computation graph (proportional
+            # to N × H × W × volume_size) throughout the entire backward pass.
+            # When backbone gradient checkpointing then RECOMPUTES backbone
+            # activations (in the same backward call), both graphs must coexist
+            # in GPU memory simultaneously — causing OOM on typical GPUs.
+            #
+            # With checkpointing: reco() intermediates are discarded after
+            # forward and recomputed on-demand during backward, so they are
+            # freed before backbone recomputation begins.  This also eliminates
+            # the progressive memory fragmentation from repeated alloc/free of
+            # differently-sized reco graphs across scans.
+            return grad_ckpt(_body, source, series, use_reentrant=False)
         else:
             with torch.no_grad():
-                return _body()
+                return _body(source, series)
 
     # ------------------------------------------------------------------
     # Backbone inference
@@ -255,17 +391,36 @@ class Online_Finetuning_Backbone(models.BaseModel):
 
         Returns:
             fake_gaps  (N-1, 6)  predicted gaps [tx,ty,tz, rx,ry,rz] (descaled)
+
+        Memory note — backbone_input_scale
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        EfficientNet-B1 backward on (chunk_size, 2, 480, 640) requires ~6 GB
+        of intermediate activations, which exceeds a 7.6 GB GPU when combined
+        with source_full and optimizer states.  backbone_input_scale (default
+        0.5) downsamples frames to (chunk_size, 2, 240, 320) before the
+        backbone, cutting backward peak from 6040 MB → 1672 MB.  The reco()
+        call and _find_intersecting_frame always use the original 480×640
+        frames, so reconstruction quality is unaffected.
         """
         N = source.shape[0]
+
+        # Spatial downscale for backbone input only.
+        # reco() uses the original-resolution source; only the backbone sees
+        # the downsampled version.
+        bb_scale = float(getattr(self.cfg, 'backbone_input_scale', 0.5))
+
         chunk_outputs = []
 
         for start in range(0, N - 1, self.backbone_chunk_size):
             end = min(start + self.backbone_chunk_size, N - 1)
 
             # Build pair chunk on-the-fly to avoid allocating the full pairs tensor
-            chunk = torch.cat(
-                [source[start:end], source[start + 1:end + 1]], dim=1
-            ).unsqueeze(0)                 # (1, k, 2, H, W)
+            s0 = source[start:end]           # (k, 1, H, W)
+            s1 = source[start + 1:end + 1]  # (k, 1, H, W)
+            if bb_scale != 1.0:
+                s0 = F.interpolate(s0, scale_factor=bb_scale, mode='bilinear', align_corners=False)
+                s1 = F.interpolate(s1, scale_factor=bb_scale, mode='bilinear', align_corners=False)
+            chunk = torch.cat([s0, s1], dim=1).unsqueeze(0)   # (1, k, 2, H_s, W_s)
 
             if use_checkpoint:
                 # Recompute activations during backward — saves ~90 % of backbone memory
@@ -615,7 +770,472 @@ class Online_Finetuning_Backbone(models.BaseModel):
         # )
         # # ╚══════════════════════════════════════════════════════════════════╝
 
-        return {'loss_slice': loss_slice}
+        losses = {'loss_slice': loss_slice}
+
+        # ── 5. Loss 2 + Loss 3: rotation losses ──────────────────────────────
+        # Both losses share the same rotated slice; compute together when either
+        # weight is non-zero.
+        weight_loss_rot    = float(getattr(self.cfg, 'weight_loss_rot',    0.0))
+        weight_loss_jagged = float(getattr(self.cfg, 'weight_loss_jagged', 0.0))
+        if weight_loss_rot > 0 or weight_loss_jagged > 0:
+            losses.update(self._rotation_consistency_loss(
+                volume, bias_origin, gt_pos, real_small, H, W, H_c, W_c, crit_scale,
+            ))
+
+        # ── 6. Loss 4: adjacent trajectory-frame SSIM ────────────────────────
+        # Extracts volume slices at consecutive predicted scan positions and
+        # penalises their dissimilarity, encouraging volumetric smoothness
+        # along the actual scan direction.
+        weight_loss_ssim = float(getattr(self.cfg, 'weight_loss_ssim', 0.0))
+        if weight_loss_ssim > 0:
+            losses['loss_ssim'] = self._volume_ssim_loss(
+                volume, bias_origin, fake_series, H, W, crit_scale, weight_loss_ssim,
+            )
+
+        return losses
+
+    # ------------------------------------------------------------------
+    # Volume SSIM loss helper (Loss 4)
+    # ------------------------------------------------------------------
+
+    def _volume_ssim_loss(self, volume, bias_origin, fake_series, H, W, crit_scale, weight):
+        """Loss 4: 1 − mean SSIM between adjacent trajectory-frame slices.
+
+        Instead of axis-aligned volume planes, slices are extracted at the
+        **predicted probe positions** (fake_series), so adjacent pairs
+        correspond to consecutive frames along the actual scan direction.
+        High SSIM between adjacent slices encourages a smooth, consistent
+        reconstruction along the trajectory.
+
+        Loss 4 = weight × (1 − mean_SSIM)
+
+        Slice extraction
+        ~~~~~~~~~~~~~~~~
+        For trajectory indices a and b = a+1 (or a random subset):
+
+            pos_vol = fake_series[a] − bias_origin      (volume-mm coords)
+            slice   = get_slice(volume, pos_vol, (H_c, W_c), ...)
+
+        The slices are at the same physical orientation as the real US frames
+        (oblique planes matching the probe geometry), not axis-aligned.
+
+        Gradient paths
+        ~~~~~~~~~~~~~~
+        **Sparse path** (dense_grad=False, default):
+            volume is detached.  Gradient flows through the *coordinates*:
+                fake_series[a] → series_vol → get_slice grid → SSIM → loss
+                bias_origin    → series_vol → get_slice grid → SSIM → loss
+            Signal: adjust predicted positions so adjacent frames' volume
+            content is similar (smooth trajectory).
+
+        **Dense path** (dense_grad=True):
+            Additional gradient through voxel intensities:
+                fake_series → reco → volume voxels → SSIM → loss
+
+        Config keys consumed
+        ~~~~~~~~~~~~~~~~~~~~
+        ssim_window_size  int    Gaussian window width (default 11)
+        ssim_num_pairs    int    frame pairs evaluated per step
+                                  (-1 = all N-1 pairs, default -1).
+                                  Reduce (e.g. 16) to cap memory cost.
+
+        Args:
+            volume       (D, H', W')   reconstructed 3-D volume
+            bias_origin  (3,)           differentiable vol-mm origin
+            fake_series  (N, 3, 3)     predicted probe positions (world-mm)
+            H, W         int            full-resolution image dimensions
+            crit_scale   float          criterion downscale factor
+            weight       float          weight_loss_ssim read by caller
+
+        Returns:
+            scalar Tensor  weighted (1 − mean_SSIM)
+        """
+        N = fake_series.shape[0]
+        if N < 2:
+            return torch.tensor(0.0, device=volume.device, dtype=volume.dtype)
+
+        window_size = int(getattr(self.cfg, 'ssim_window_size', 11))
+        num_pairs   = int(getattr(self.cfg, 'ssim_num_pairs',   -1))
+
+        H_c = max(1, int(H * crit_scale))
+        W_c = max(1, int(W * crit_scale))
+
+        # ── Select adjacent trajectory index pairs ─────────────────────
+        if 0 < num_pairs < N - 1:
+            perm  = torch.randperm(N - 1, device=fake_series.device)[:num_pairs]
+            idx_a = perm
+        else:
+            idx_a = torch.arange(N - 1, device=fake_series.device)
+        idx_b = idx_a + 1
+
+        # ── Convert predicted positions to volume coordinates ──────────
+        # bias_origin carries gradient in both sparse and dense paths.
+        series_a_vol = fake_series[idx_a] - bias_origin.view(1, 1, 3)  # (M, 3, 3)
+        series_b_vol = fake_series[idx_b] - bias_origin.view(1, 1, 3)  # (M, 3, 3)
+
+        # ── Extract slices at trajectory positions ─────────────────────
+        # get_slice returns (1, M, 1, H_c, W_c); squeeze batch dim → (M, 1, H_c, W_c)
+        slices_a = my_utils.get_slice(
+            volume, series_a_vol, (H_c, W_c),
+            scale_h=self.scale_h / crit_scale,
+            scale_w=self.scale_w / crit_scale,
+        ).squeeze(0)   # (M, 1, H_c, W_c)
+
+        slices_b = my_utils.get_slice(
+            volume, series_b_vol, (H_c, W_c),
+            scale_h=self.scale_h / crit_scale,
+            scale_w=self.scale_w / crit_scale,
+        ).squeeze(0)   # (M, 1, H_c, W_c)
+
+        ssim_val = _batch_ssim(slices_a, slices_b, window_size=window_size)
+        return (1.0 - ssim_val) * weight
+
+    # ------------------------------------------------------------------
+    # Rotation losses helper (Loss 2 + Loss 3)
+    # ------------------------------------------------------------------
+
+    def _rotation_consistency_loss(
+        self, volume, bias_origin, gt_pos, real_small, H, W, H_c, W_c, crit_scale,
+    ):
+        """Weighted rotation losses sharing a single rotated slice.
+
+        Computes Loss 2 and/or Loss 3 from the same rotated-frame slice so
+        that ``get_slice`` is called only once regardless of which losses are
+        enabled.
+
+        Algorithm
+        ~~~~~~~~~
+        1. Derive the local frame axes (ax_x, ax_y, ax_z) from gt_pos.
+        2. Sample a random tilt θ ∈ [-rotation_max_angle, +rotation_max_angle]
+           around ax_x (the horizontal in-plane axis of the probe).
+        3. Build a rotated frame: same center and physical size, but ax_y is
+           replaced by  cos(θ)·ax_y + sin(θ)·ax_z.
+        4. Extract a volume slice at the rotated position  → slice_rot.
+
+        Loss 2 — 3-D rotation consistency (``loss_rot``)
+            The original and rotated planes intersect along the line
+            center + ax_x·t, which corresponds to the **center row**
+            (mesh_x = 0) of both slices and of the real image.
+            loss_rot = L1(center_row(slice_rot), center_row(real_small))
+
+        Loss 3 — jaggedness of the rotated slice (``loss_jagged``)
+            A consistent volume produces smooth slices at any orientation.
+            Trajectory errors cause staircase artifacts (horizontal stripes)
+            in oblique slices.  Isotropic total variation penalises this:
+            loss_jagged = mean|Δrow(slice_rot)| + mean|Δcol(slice_rot)|
+
+        Gradient path (sparse, same as loss_slice)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        bias_origin → gt_pos_rot_vol → get_slice / F.grid_sample ∂grid
+            → loss_rot / loss_jagged
+
+        Args:
+            volume      (D, H', W')        reconstructed 3-D volume
+            bias_origin (3,)               differentiable vol-mm origin
+            gt_pos      (1, 3, 3)          GT world-mm position (detached)
+            real_small  (1, 1, H_c, W_c)  real US frame at gt_pos
+            H, W        int                full-resolution image dims
+            H_c, W_c    int                criterion-scale dims
+            crit_scale  float              criterion downscale factor
+
+        Returns:
+            dict[str, Tensor]  subset of {loss_rot, loss_jagged} — only keys
+            whose config weight is > 0 are included, already weighted.
+        """
+        weight_loss_rot    = float(getattr(self.cfg, 'weight_loss_rot',    0.0))
+        weight_loss_jagged = float(getattr(self.cfg, 'weight_loss_jagged', 0.0))
+        max_angle          = float(getattr(self.cfg, 'rotation_max_angle', torch.pi / 6))
+
+        # ── Frame axes from gt_pos ─────────────────────────────────────
+        axis = my_utils.get_axis(gt_pos.float())  # (1, 3, 3) rows: ax_x, ax_y, ax_z
+        ax_x = axis[0, 0]                          # (3,) horizontal in-plane axis
+        ax_y = axis[0, 1]                          # (3,)
+        ax_z = axis[0, 2]                          # (3,) normal to the frame
+
+        # ── Random tilt around ax_x ────────────────────────────────────
+        theta = (torch.rand(1, device=gt_pos.device).item() * 2.0 - 1.0) * max_angle
+        dev, dt = gt_pos.device, gt_pos.dtype
+        cos_t    = torch.tensor(theta, device=dev, dtype=dt).cos()
+        sin_t    = torch.tensor(theta, device=dev, dtype=dt).sin()
+        ax_y_rot = cos_t * ax_y + sin_t * ax_z   # rotated ax_y; ax_x unchanged
+
+        # ── Rotated frame in world-mm (same center, same physical size) ─
+        half_w = (W - 1) / 2.0 * self.scale_w
+        half_h = (H - 1) / 2.0 * self.scale_h
+        center = gt_pos[0, 0]                      # (3,) world-mm center
+        ll_rot = center - ax_x * half_w - ax_y_rot * half_h
+        lr_rot = center + ax_x * half_w - ax_y_rot * half_h
+        gt_pos_rot = torch.stack([center, ll_rot, lr_rot]).unsqueeze(0)  # (1, 3, 3)
+
+        # ── Shift into volume coordinates (gradient via bias_origin) ───
+        gt_pos_rot_vol = gt_pos_rot - bias_origin.view(1, 1, 3)
+
+        # ── Extract rotated slice (shared by Loss 2 and Loss 3) ────────
+        slice_rot = my_utils.get_slice(
+            volume, gt_pos_rot_vol, (H_c, W_c),
+            scale_h=self.scale_h / crit_scale,
+            scale_w=self.scale_w / crit_scale,
+        ).squeeze(0)   # (1, 1, H_c, W_c)
+
+        losses = {}
+
+        # ── Loss 2: center-row consistency ─────────────────────────────
+        if weight_loss_rot > 0:
+            h_mid           = H_c // 2
+            real_center_row = real_small[:, :, h_mid, :]   # (1, 1, W_c) — no grad
+            rot_center_row  = slice_rot[:, :, h_mid, :]    # (1, 1, W_c) — grad via bias_origin
+            losses['loss_rot'] = (
+                F.l1_loss(rot_center_row, real_center_row.detach()) * weight_loss_rot
+            )
+
+        # ── Loss 3: jaggedness (isotropic TV of the rotated slice) ────
+        # A trajectory-consistent volume yields smooth oblique slices.
+        # Staircase artifacts from misaligned scan frames produce sharp
+        # row-to-row discontinuities → high TV → gradient pushes the
+        # predicted trajectory toward a smoother reconstruction.
+        if weight_loss_jagged > 0:
+            drow = (slice_rot[:, :, 1:, :] - slice_rot[:, :, :-1, :]).abs()  # (1,1,H_c-1,W_c)
+            dcol = (slice_rot[:, :, :, 1:] - slice_rot[:, :, :, :-1]).abs()  # (1,1,H_c,W_c-1)
+            losses['loss_jagged'] = (drow.mean() + dcol.mean()) * weight_loss_jagged
+
+        # # ╔══════════════════════════════════════════════════════════════════╗
+        # # ║  DEBUG: rotation-consistency visualisation                      ║
+        # # ╚══════════════════════════════════════════════════════════════════╝
+        # self._debug_visualise_rotation_consistency(
+        #     volume      = volume,
+        #     bias        = bias_origin.detach(),
+        #     gt_pos      = gt_pos,
+        #     gt_pos_rot  = gt_pos_rot,
+        #     ax_x        = ax_x,
+        #     real_small  = real_small,
+        #     slice_rot   = slice_rot.detach(),
+        #     theta       = theta,
+        #     loss_rot    = losses.get('loss_rot'),
+        #     loss_jagged = losses.get('loss_jagged'),
+        # )
+        # # ╚══════════════════════════════════════════════════════════════════╝
+
+        return losses
+
+    # ------------------------------------------------------------------
+    # Debug visualisation for rotation consistency loss
+    # ------------------------------------------------------------------
+
+    def _debug_visualise_rotation_consistency(
+        self,
+        volume,
+        bias,
+        gt_pos,
+        gt_pos_rot,
+        ax_x,
+        real_small,
+        slice_rot,
+        theta,
+        loss_rot=None,
+        loss_jagged=None,
+    ):
+        """Visualise Loss 2 (rotation consistency) and Loss 3 (jaggedness).
+
+        Shows two blocking windows (close each to continue):
+
+        **Window 1 — Matplotlib** (2-row layout):
+
+        Top row (4 panels):
+        ┌──────────────┬──────────────┬──────────────┬──────────────┐
+        │  Real image  │ Rotated slice│  Jaggedness  │ |Diff| at    │
+        │  (center row │ (center row  │  |∇slice_rot|│  center row  │
+        │  highlighted)│  highlighted)│  heatmap     │  bar chart   │
+        └──────────────┴──────────────┴──────────────┴──────────────┘
+        Bottom row (full width):
+        ┌─────────────────────────────────────────────────────────────┐
+        │  1-D signal comparison along the intersection line          │
+        │  real (green) vs rotated-slice (orange)                     │
+        └─────────────────────────────────────────────────────────────┘
+
+        **Window 2 — PyVista** (3-D):
+        • Reconstructed volume (bone colormap, sigmoid opacity)
+        • Original GT frame — green quad with real-image texture
+        • Rotated frame — cyan wireframe
+        • Intersection line — red line through center along ax_x
+
+        Args:
+            volume      (D, H', W')        reconstructed volume (no grad)
+            bias        (3,)               world-mm origin offset (detached)
+            gt_pos      (1, 3, 3)          original GT position (world-mm)
+            gt_pos_rot  (1, 3, 3)          rotated position (world-mm)
+            ax_x        (3,)               horizontal in-plane axis (unit vec)
+            real_small  (1, 1, H_c, W_c)  real US image at criterion scale
+            slice_rot   (1, 1, H_c, W_c)  rotated slice (detached)
+            theta       float              rotation angle used (radians)
+            loss_rot    Tensor | None      weighted Loss 2 value (for display)
+            loss_jagged Tensor | None      weighted Loss 3 value (for display)
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+        import pyvista as pv
+        from utils.plot_functions import add_series_rects
+
+        # ── Numpy arrays ───────────────────────────────────────────────
+        real_np  = real_small.squeeze().cpu().float().numpy()    # (H_c, W_c)
+        rot_np   = slice_rot.squeeze().cpu().float().numpy()     # (H_c, W_c)
+        H_c, W_c = real_np.shape
+        h_mid    = H_c // 2
+
+        real_row = real_np[h_mid]          # (W_c,) — Loss 2 reference
+        rot_row  = rot_np[h_mid]           # (W_c,)
+        diff_row = np.abs(real_row - rot_row)
+
+        # Jaggedness map: |Δrow| + |Δcol| (Loss 3 signal)
+        drow_np = np.abs(np.diff(rot_np, axis=0))   # (H_c-1, W_c)
+        dcol_np = np.abs(np.diff(rot_np, axis=1))   # (H_c, W_c-1)
+        # Pad to (H_c, W_c) for display (replicate last row/col)
+        jagged_np = np.pad(drow_np, ((0, 1), (0, 0)), mode='edge') \
+                  + np.pad(dcol_np, ((0, 0), (0, 1)), mode='edge')
+
+        # Highlight the center row
+        real_hi = real_np.copy(); real_hi[h_mid] = 1.0
+        rot_hi  = rot_np.copy();  rot_hi[h_mid]  = 1.0
+
+        theta_deg   = float(np.degrees(theta))
+        rot_str     = f'loss_rot={loss_rot.item():.4f}'    if loss_rot    is not None else 'loss_rot=disabled'
+        jagged_str  = f'loss_jagged={loss_jagged.item():.4f}' if loss_jagged is not None else 'loss_jagged=disabled'
+
+        # ══════════════════════════════════════════════════════════════
+        # Window 1 — Matplotlib
+        # ══════════════════════════════════════════════════════════════
+        fig = plt.figure(figsize=(22, 8))
+        gs  = gridspec.GridSpec(
+            2, 4, figure=fig,
+            height_ratios=[2, 1],
+            hspace=0.38, wspace=0.12,
+        )
+
+        ax_real   = fig.add_subplot(gs[0, 0])
+        ax_rot    = fig.add_subplot(gs[0, 1])
+        ax_jagged = fig.add_subplot(gs[0, 2])
+        ax_diff   = fig.add_subplot(gs[0, 3])
+        ax_sig    = fig.add_subplot(gs[1, :])   # full-width 1-D comparison
+
+        # — Real US image (center row highlighted) —
+        ax_real.imshow(real_hi, cmap='gray', vmin=0, vmax=1, aspect='auto')
+        ax_real.axhline(h_mid, color='lime', linewidth=1.5, linestyle='--', alpha=0.8)
+        ax_real.set_title('Real US image\n(GT pos, center row = intersection)', fontsize=10)
+        ax_real.axis('off')
+
+        # — Rotated slice (center row highlighted) —
+        ax_rot.imshow(rot_hi, cmap='gray', vmin=0, vmax=1, aspect='auto')
+        ax_rot.axhline(h_mid, color='orange', linewidth=1.5, linestyle='--', alpha=0.8)
+        ax_rot.set_title(
+            f'Rotated slice  θ={theta_deg:+.1f}°\n(center row = same intersection)',
+            fontsize=10,
+        )
+        ax_rot.axis('off')
+
+        # — Jaggedness heatmap: |∇slice_rot| (Loss 3) —
+        jmax = max(jagged_np.max(), 1e-6)
+        im_j = ax_jagged.imshow(jagged_np, cmap='hot', vmin=0, vmax=jmax, aspect='auto')
+        ax_jagged.axhline(h_mid, color='cyan', linewidth=1.0, linestyle='--', alpha=0.7)
+        ax_jagged.set_title(
+            f'Jaggedness  |Δrow|+|Δcol|\n{jagged_str}',
+            fontsize=10,
+        )
+        ax_jagged.axis('off')
+        plt.colorbar(im_j, ax=ax_jagged, fraction=0.046, pad=0.02)
+
+        # — |Diff| at center row (bar chart, Loss 2) —
+        xs = np.arange(W_c)
+        ax_diff.bar(xs, diff_row, color='crimson', width=1.0, linewidth=0)
+        ax_diff.set_xlim(0, W_c)
+        ax_diff.set_ylim(0, max(diff_row.max() * 1.1, 0.05))
+        ax_diff.set_title(f'|Real−Rot| at center row\n{rot_str}', fontsize=10)
+        ax_diff.set_xlabel('pixel col'); ax_diff.set_ylabel('|diff|')
+
+        # — 1-D signal comparison (full width, Loss 2) —
+        ax_sig.plot(xs, real_row, color='limegreen',  linewidth=1.5, label='Real image (center row)')
+        ax_sig.plot(xs, rot_row,  color='darkorange', linewidth=1.5,
+                    label=f'Rotated slice center row (θ={theta_deg:+.1f}°)')
+        ax_sig.fill_between(xs, real_row, rot_row, alpha=0.2, color='crimson', label='|diff|')
+        ax_sig.set_xlim(0, W_c); ax_sig.set_ylim(-0.05, 1.05)
+        ax_sig.set_xlabel('pixel column (along ax_x = 3-D intersection line)')
+        ax_sig.set_ylabel('intensity')
+        ax_sig.set_title('Center-row 1-D comparison (Loss 2)', fontsize=10)
+        ax_sig.legend(loc='upper right', fontsize=9)
+        ax_sig.grid(True, alpha=0.3)
+
+        fig.suptitle(
+            f'DEBUG rotation losses   θ={theta_deg:+.1f}°   {rot_str}   {jagged_str}',
+            fontsize=12,
+        )
+        plt.show()   # ← blocks until closed
+
+        # ══════════════════════════════════════════════════════════════
+        # Window 2 — PyVista: 3-D view
+        # ══════════════════════════════════════════════════════════════
+        vol_np       = volume.cpu().float().numpy()                 # (D, H', W')
+        bias_cpu     = bias.cpu()                                   # (3,)
+        ax_x_np      = ax_x.detach().cpu().float().numpy()          # (3,)
+
+        # Volume-coordinate positions (subtract bias)
+        gt_pos_vol     = (gt_pos.cpu()     - bias_cpu).float().numpy()   # (1, 3, 3)
+        gt_pos_rot_vol = (gt_pos_rot.cpu() - bias_cpu).float().numpy()   # (1, 3, 3)
+        center_vol     = gt_pos_vol[0, 0]                                 # (3,)
+
+        # Intersection line: center ± half_w along ax_x
+        ll_vol = gt_pos_vol[0, 1]; lr_vol = gt_pos_vol[0, 2]
+        half_w = float(np.linalg.norm(lr_vol - ll_vol)) / 2.0
+        line_a = center_vol - ax_x_np * half_w
+        line_b = center_vol + ax_x_np * half_w
+
+        real_u8 = (np.clip(real_np, 0, 1) * 255).astype(np.uint8)
+
+        pv_title = (
+            f'DEBUG rotation losses   θ={theta_deg:+.1f}°   '
+            f'{rot_str}   {jagged_str}'
+        )
+        plotter = pv.Plotter(title=pv_title)
+
+        # Volume rendering
+        grid = pv.ImageData()
+        grid.dimensions = np.array(vol_np.shape)
+        grid.spacing    = (1.0, 1.0, 1.0)
+        grid.point_data['Intensity'] = vol_np.flatten(order='F')
+        plotter.add_volume(grid, scalars='Intensity', cmap='bone', opacity='sigmoid')
+
+        # Original GT frame — green, textured with real image
+        add_series_rects(
+            plotter, gt_pos_vol, indices=[0],
+            colors='green', opacity=0.15, edge_width=3,
+            frames=real_u8[np.newaxis],
+        )
+
+        # Rotated frame — cyan wireframe, no fill
+        add_series_rects(
+            plotter, gt_pos_rot_vol, indices=[0],
+            colors='cyan', opacity=0, edge_width=3,
+        )
+
+        # Intersection line — red
+        line_pts  = np.array([line_a, line_b], dtype=np.float32)
+        line_mesh = pv.Spline(line_pts, n_points=2)
+        plotter.add_mesh(line_mesh, color='red', line_width=4)
+
+        # Center point
+        plotter.add_points(
+            center_vol.reshape(1, 3).astype(np.float32),
+            color='yellow', point_size=12, render_points_as_spheres=True,
+        )
+
+        plotter.add_text(
+            f'green  = original GT frame (real image texture)\n'
+            f'cyan   = rotated frame (θ={theta_deg:+.1f}° around ax_x)\n'
+            f'red    = intersection line (Loss 2: center row)\n'
+            f'yellow = shared center point\n'
+            f'{rot_str}   {jagged_str}',
+            position='upper_left', font_size=9, color='white',
+        )
+        plotter.show_axes()
+        plotter.set_background('black')
+        plotter.show()   # ← blocks until closed
 
     # ------------------------------------------------------------------
     # Debug visualisation for custom_criterion
@@ -892,11 +1512,19 @@ class Online_Finetuning_Backbone(models.BaseModel):
             # dense_grad=False: reco() runs under no_grad → gradient flows
             #                   only through the bounding-box origin (bias)
             dense_grad = bool(getattr(self.cfg, 'dense_grad', False))
-            volume, bias = self._reconstruct_volume(
-                source.detach(),
-                fake_series if dense_grad else fake_series.detach(),
-                enable_grad=dense_grad,
-            )                                                               # (D,H',W'), (3,)
+            try:
+                volume, bias = self._reconstruct_volume(
+                    source.detach().clone(),
+                    fake_series if dense_grad else fake_series.detach(),
+                    enable_grad=dense_grad,
+                )                                                           # (D,H',W'), (3,)
+            except (ValueError, RuntimeError) as _reco_err:
+                # Degenerate trajectory: either the pre-check raised ValueError
+                # (too many voxels) or meshgrid raised RuntimeError (overflow).
+                # Discard this window and let the retry loop pick a new one.
+                del fake_gaps, fake_series
+                torch.cuda.empty_cache()
+                continue
 
             # # ╔══════════════════════════════════════════════════════════════════╗
             # # ║  DEBUG: 3-D volume visualisation — comment out for training     ║
@@ -912,6 +1540,30 @@ class Online_Finetuning_Backbone(models.BaseModel):
             # ── 4. Self-supervised loss (retry if no intersection) ────────
             losses = self.custom_criterion(source, fake_gaps, fake_series, volume, bias)
             if losses is not None:
+                # Record the component keys so that failed scans can return
+                # zeros for the same keys, keeping _count aligned with every
+                # loss value in loss_all for BaseModel.train_return_hook.
+                self._component_loss_keys = list(losses.keys()) + ['grad_norm']
+
+                # ── Pre-backward memory release ───────────────────────────
+                # source_full (N_full × 1 × H × W, ~700 MB for long scans)
+                # is no longer needed: _find_intersecting_frame has already
+                # completed inside custom_criterion.  We free it here — before
+                # loss.backward() — to give the CUDA allocator ~700 MB of
+                # headroom for the reco() recomputation that grad_ckpt triggers
+                # during backward.
+                #
+                # Why .clone() above matters:
+                #   source.detach() shares storage with source_full (view).
+                #   Without .clone(), the checkpoint would hold a reference
+                #   to that shared storage, keeping all 700 MB alive even
+                #   after we delete source and source_full here.
+                #   source.detach().clone() gives the checkpoint an independent
+                #   19 MB copy, so deleting source + source_full below truly
+                #   releases the 700 MB before backward.
+                del source, source_full
+                self._scan_ctx.clear()
+                torch.cuda.empty_cache()
                 break   # valid window found; exit retry loop
 
             # No qualifying frame found — release GPU tensors before the next
@@ -922,14 +1574,65 @@ class Online_Finetuning_Backbone(models.BaseModel):
 
         if losses is None:
             # All window re-sampling attempts failed; skip gradient step.
-            return {'loss': torch.tensor(0.0, device=self.device)}
+            # Still clear the scan context so source_full is released now
+            # rather than persisting until the next call to train().
+            self._scan_ctx.clear()
+            torch.cuda.empty_cache()
+            # Return zeros for ALL component loss keys so that every scan
+            # contributes exactly one entry to each key in loss_all.
+            # BaseModel.train_return_hook does `_count @ value / _count_sum`
+            # which requires len(_count) == len(value) for every key.
+            # Returning only {'loss': 0.0} while successful scans also include
+            # 'loss_slice' (and any other custom_criterion keys) would cause
+            # a "inconsistent tensor size" RuntimeError at epoch end.
+            zero = torch.tensor(0.0, device=self.device)
+            return {'loss': zero, **{k: zero for k in self._component_loss_keys}}
 
         loss = sum(losses.values())
         loss.backward()
+
+        # ── Gradient clipping ─────────────────────────────────────────────
+        # reco()'s _get_weight contains softmax(w / T=0.001) whose gradient
+        # has magnitude ~1/T = 1000×, causing gradient explosion without
+        # clipping.  clip_grad_norm_ returns the UNCLIPPED total norm so we
+        # can monitor it; it only modifies gradients when the norm exceeds
+        # grad_clip_norm (default 1.0).  Set cfg.grad_clip_norm=0 to disable.
+        if self.grad_clip_norm > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.backbone.parameters(),
+                max_norm=self.grad_clip_norm,
+            )
+        else:
+            # Compute norm for monitoring without modifying gradients
+            grad_norm = torch.sqrt(torch.stack([
+                p.grad.detach().norm() ** 2
+                for p in self.backbone.parameters()
+                if p.grad is not None
+            ]).sum())
+
         self.optimizer.step()
         self.scheduler.step(epoch_info['epoch'])
 
-        return {'loss': loss.detach(), **{k: v.detach() for k, v in losses.items()}}
+        ret = {
+            'loss':      loss.detach(),
+            'grad_norm': grad_norm.detach(),
+            **{k: v.detach() for k, v in losses.items()},
+        }
+
+        # ── Inter-scan GPU memory cleanup ─────────────────────────────────
+        # source / source_full were already released in the pre-backward
+        # block above (del source, source_full + _scan_ctx.clear()), so
+        # _scan_ctx.clear() here is a no-op.  It is kept for safety in case
+        # a future code path reaches this point without having cleared it.
+        # The remaining gradient-related tensors are explicitly deleted so
+        # PyTorch can reclaim their slabs before the next scan allocates its
+        # own source_full (~700 MB), preventing the brief double-allocation
+        # window that fragments the CUDA cache pool.
+        self._scan_ctx.clear()
+        del fake_gaps, fake_series, volume, bias, losses, loss
+        torch.cuda.empty_cache()
+
+        return ret
 
     # ------------------------------------------------------------------
     # Test step — full scan, no gradient tracking

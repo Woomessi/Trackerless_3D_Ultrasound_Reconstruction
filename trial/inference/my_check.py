@@ -1,17 +1,14 @@
 import sys
 import os
 import matplotlib
-import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import h5py
 import utils
-from utils.plot_functions import data_pairs_adjacent, transform_t2t, read_calib_matrices, reference_image_points, plot_scan
-from models.online_baseline_backbone import Backbone
+from utils.plot_functions import data_pairs_adjacent, transform_t2t, read_calib_matrices, reference_image_points
+from models.backup.online_baseline_backbone import Backbone
 from utils.simulation import dof_to_series
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

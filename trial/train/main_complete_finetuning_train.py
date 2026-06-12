@@ -242,24 +242,63 @@ class Main(object):
 
     def val_test(self, epoch):
         self.test(epoch, data_loader=self.val_loader,  log_text='Val')
-        self.test(epoch, data_loader=self.test_loader, log_text='Test')
+        # self.test(epoch, data_loader=self.test_loader, log_text='Test')
+        self.test_loss(epoch, data_loader=self.val_loader,  prefix='val')
+        # self.test_loss(epoch, data_loader=self.test_loader, prefix='test')
+
+    # ------------------------------------------------------------------
+    # Test-set loss evaluation (no gradient update)
+    # ------------------------------------------------------------------
+
+    def test_loss(self, epoch, data_loader=None, prefix='test'):
+        """Compute self-supervised loss on a split and save to *_{prefix}_loss.npy."""
+        torch.cuda.empty_cache()
+        data_loader = data_loader or self.test_loader
+        n_scans  = len(data_loader)
+        loss_all = {}
+
+        epoch_info = {
+            'epoch':           epoch,
+            'batch_per_epoch': n_scans,
+            'count_data':      n_scans,
+        }
+
+        for scan_idx, (sample_dict, index) in enumerate(data_loader):
+            epoch_info['batch_idx']   = scan_idx
+            epoch_info['index']       = index
+            epoch_info['batch_count'] = 1
+
+            loss_dict = self.model.eval_loss(epoch_info, sample_dict)
+            loss_dict['_count'] = 1
+            utils.common.merge_dict(loss_all, loss_dict)
+
+        loss_file = os.path.join(
+            self.path,
+            self.model.name + '_' + str(epoch) + '_' + prefix + '_loss.npy',
+        )
+        self.logger.save_npy(
+            loss_file,
+            {k: v.cpu().detach().numpy() if isinstance(v, torch.Tensor) else v
+             for k, v in loss_all.items()},
+        )
+        self.logger.info('{} loss saved to {}'.format(prefix.capitalize(), loss_file))
+        self.plot_loss_curve()
 
     # ------------------------------------------------------------------
     # Loss curve plotting
     # ------------------------------------------------------------------
 
-    def plot_loss_curve(self):
-        pattern = os.path.join(self.path, self.model.name + '_*' + configs.env.paths.loss_file)
+    def _load_loss_files(self, suffix):
+        """Load per-epoch loss .npy files matching *<suffix> and return (epochs, loss_data)."""
+        regex   = re.compile(r'_(\d+)' + re.escape(suffix) + r'$')
+        pattern = os.path.join(self.path, self.model.name + '_*' + suffix)
         files   = sorted(
-            glob.glob(pattern),
-            key=lambda p: int(re.search(r'_(\d+)_loss\.npy$', p).group(1)),
+            [p for p in glob.glob(pattern) if regex.search(p)],
+            key=lambda p: int(regex.search(p).group(1)),
         )
-        if not files:
-            return
-
         epochs, loss_data = [], {}
         for fpath in files:
-            m = re.search(r'_(\d+)_loss\.npy$', fpath)
+            m = regex.search(fpath)
             if m is None:
                 continue
             ep   = int(m.group(1))
@@ -271,24 +310,40 @@ class Main(object):
                 val    = np.array(val, dtype=np.float32).flatten()
                 scalar = float(np.dot(count[:len(val)], val[:len(count)]) / count_sum)
                 loss_data.setdefault(key, []).append(scalar)
+        return epochs, loss_data
 
-        if not epochs:
+    def plot_loss_curve(self):
+        train_epochs, train_data = self._load_loss_files('_loss.npy')
+        val_epochs,   val_data   = self._load_loss_files('_val_loss.npy')
+        if not train_epochs and not val_epochs:
             return
 
-        keys  = [k for k in loss_data if k != 'loss']
-        n     = len(keys) + 1
+        all_keys = ['loss'] + sorted({
+            k for d in (train_data, val_data) for k in d if k != 'loss'
+        })
+        n     = len(all_keys)
         ncols = min(n, 3)
         nrows = (n + ncols - 1) // ncols
 
         fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
         axes_flat  = axes.flatten()
 
-        for i, key in enumerate(['loss'] + keys):
+        for i, key in enumerate(all_keys):
             ax = axes_flat[i]
-            ax.plot(epochs, loss_data[key], marker='o', markersize=3)
+            plotted = False
+            if key in train_data and train_epochs:
+                ax.plot(train_epochs, train_data[key], marker='o', markersize=3,
+                        color='steelblue', label='train')
+                plotted = True
+            if key in val_data and val_epochs:
+                ax.plot(val_epochs, val_data[key], marker='^', markersize=3,
+                        color='seagreen', label='val')
+                plotted = True
             ax.set_title(key)
             ax.set_xlabel('Epoch')
             ax.grid(True)
+            if plotted:
+                ax.legend(fontsize=8)
 
         for j in range(n, len(axes_flat)):
             axes_flat[j].set_visible(False)
