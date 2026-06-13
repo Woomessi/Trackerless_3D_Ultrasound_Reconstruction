@@ -4,14 +4,15 @@
     "h5":    "/media/wu/Extreme SSD/datasets/11178509/train_part1",
     "calib": "data/calib_matrix.csv"
   },
-  "train_val_test_split": [0.60, 0.20, 0.20],
+  "train_val_test_split": [0.80, 0.10, 0.10],
   "train_test_range": [1, 1, 1],
   "series_per_data":  [50, 10, 10],
   "frame_rate": [2, 8],
+  "seq_len": 10,
   "source": {
     "width":   640,
     "height":  480,
-    "channel": 2
+    "channel": 6
   },
   "target": {
     "elements": 15

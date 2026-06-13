@@ -1,9 +1,17 @@
-import argparse
 import glob
 import os
 import re
+import sys
 import time
 
+_PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _PROJ_ROOT not in sys.path:
+    sys.path.insert(0, _PROJ_ROOT)
+
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -13,19 +21,20 @@ import datasets
 import models
 import utils
 
-# from utils.loader import Dataset
-
 
 class Main(object):
 
     def __init__(self):
-        self.model_cfg = configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/models/online_baseline_bk.json')
-
-        self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json',
-                                   gpus='0')
-        # self.run_cfg = configs.Run('/home/wu/Documents/projects/cloned_repositories/RecON/res/run/hp_bk.json')
-
-        self.dataset_cfg = datasets.functional.common.more(configs.BaseConfig('/home/wu/Documents/projects/cloned_repositories/RecON/res/datasets/TUS_subject.json'))
+        self.model_cfg = configs.BaseConfig(
+            os.path.join(_PROJ_ROOT, 'res/models/online_RecON_bk.json')
+        )
+        self.run_cfg = configs.Run(
+            os.path.join(_PROJ_ROOT, 'res/run/hp_bk.json'),
+            gpus='0'
+        )
+        self.dataset_cfg = datasets.functional.common.more(
+            configs.BaseConfig(os.path.join(_PROJ_ROOT, 'res/datasets/TUS_complete.json'))
+        )
 
         self._init()
         self._get_component()
@@ -138,7 +147,7 @@ class Main(object):
 
     def val_test(self, epoch):
         self.test(epoch, data_loader=self.val_loader, log_text='Val')
-        self.test(epoch, data_loader=self.test_loader, log_text='Test')
+        # self.test(epoch, data_loader=self.test_loader, log_text='Test')
 
     def plot_loss_curve(self):
         pattern = os.path.join(self.path, self.model.name + '_*' + configs.env.paths.loss_file)
@@ -198,8 +207,8 @@ def run():
     main = Main()
     main.split()
 
-    if main.start_epoch == 0:
-        main.val_test(main.start_epoch)
+    # if main.start_epoch == 0:
+    #     main.val_test(main.start_epoch)
     for epoch in range(main.start_epoch + 1, main.run_cfg.epochs + 1):
         main.train(epoch)
         if epoch % main.run_cfg.save_step == 0:

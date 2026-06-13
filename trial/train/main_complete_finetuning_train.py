@@ -36,6 +36,8 @@ if _PROJ_ROOT not in sys.path:
 # unallocated" fragmentation that causes OOM during backbone recomputation.
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend: no Tkinter, safe for training loops
 import matplotlib.pyplot as plt
 import numpy as np
 import torch

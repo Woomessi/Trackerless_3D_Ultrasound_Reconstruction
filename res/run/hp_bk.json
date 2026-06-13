@@ -1,6 +1,6 @@
 {
   "name": "hp_backbone",
-  "batch_size": 2,
+  "batch_size": 1,
   "test_batch_size": 1,
   "epochs": 250,
   "save_step": 10,
