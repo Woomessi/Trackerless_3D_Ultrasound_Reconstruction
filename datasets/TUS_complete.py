@@ -134,8 +134,16 @@ class TUS_complete(datasets.BaseDataset):
     def __getitem__(self, index):
         idx = self.get_idx(index)
 
+        frame_rate = torch.randint(self.cfg.frame_rate[0], self.cfg.frame_rate[1] + 1, (1,))
+        step = frame_rate.item()
+
+        # Read only the seq_len frames we actually need (strided slice = single h5 read)
         with h5py.File(self.data['h5_paths'][idx], 'r') as f:
-            frames_np = f['frames'][()]
+            total_frames = f['frames'].shape[0]
+            n_avail = min(self.cfg.seq_len * step, total_frames)
+            frames_np = f['frames'][0:n_avail:step][: self.cfg.seq_len]
+        sel = slice(0, n_avail, step)
+
         source = torch.from_numpy(frames_np.astype(np.float32) / 255.0)
         H_orig, W_orig = source.shape[1], source.shape[2]
         H_out, W_out = self.cfg.source.height, self.cfg.source.width
@@ -145,11 +153,7 @@ class TUS_complete(datasets.BaseDataset):
                 mode='bilinear', align_corners=False,
             ).squeeze(1)
         source = source.to(self.cfg.device)
-        target_point = self.data['target_point'][idx]
-
-        frame_rate = torch.randint(self.cfg.frame_rate[0], self.cfg.frame_rate[1] + 1, (1,))
-        source = source[::frame_rate.item()]
-        target_point = target_point[::frame_rate.item()]
+        target_point = self.data['target_point'][idx][sel][: self.cfg.seq_len]
 
         info = torch.tensor([len(source)])
         source = self.pad(source, self.cfg.seq_len)

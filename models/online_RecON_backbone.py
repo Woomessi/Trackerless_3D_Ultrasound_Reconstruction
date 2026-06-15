@@ -56,9 +56,14 @@ class Online_RecON_Backbone(models.BaseModel):
     def __init__(self, cfg, data_cfg, run, **kwargs):
         super().__init__(cfg, data_cfg, run, **kwargs)
         self.backbone = Backbone(self.data_cfg.source.channel, self.data_cfg.target.elements - 9).to(self.device)
+        if hasattr(torch, 'compile'):
+            self.backbone = torch.compile(self.backbone)
         self.optimizer = torch.optim.Adam(self.backbone.parameters(), lr=self.run.lr, betas=self.run.betas)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=self.run.step_size, gamma=self.run.gamma)
         self.flag_motion = True
+        # BF16 AMP: A100 tensor cores, no loss scaling needed
+        self._amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        self._scaler = torch.cuda.amp.GradScaler(enabled=(self._amp_dtype == torch.float16))
 
     def criterion(self, real_target, fake_target, feature=None):
         real_dist, real_angle = real_target.split([3, self.data_cfg.target.elements - 12], dim=-1)
@@ -88,14 +93,17 @@ class Online_RecON_Backbone(models.BaseModel):
         real_target[:, :, 3:] = real_target[:, :, 3:] * 100
 
         self.backbone.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         input = torch.cat([real_source[:, :-1, ...], real_source[:, 1:, ...], edge[:, :-1, ...], edge[:, 1:, ...], optical_flow], dim=2)
-        fake_target, feature = self.backbone(input, return_feature=self.flag_motion)
 
-        losses = self.criterion(real_target, fake_target, feature)
-        loss = sum(losses.values())
-        loss.backward()
-        self.optimizer.step()
+        with torch.cuda.amp.autocast(dtype=self._amp_dtype):
+            fake_target, feature = self.backbone(input, return_feature=self.flag_motion)
+            losses = self.criterion(real_target, fake_target, feature)
+            loss = sum(losses.values())
+
+        self._scaler.scale(loss).backward()
+        self._scaler.step(self.optimizer)
+        self._scaler.update()
         self.scheduler.step(epoch_info['epoch'])
 
         return {'loss': loss, **losses}
