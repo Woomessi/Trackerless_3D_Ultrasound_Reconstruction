@@ -1,11 +1,11 @@
 """
-Inference script for Online_Baseline_Backbone.
+Inference script for Online_LSTM_Backbone.
 
-Loads the latest checkpoint (epoch 5) from
-  save/online_baseline_bk-hp_bk-TUS_subject/
-and runs it on one .h5 file from data/frames_transfs/.
+Loads the latest checkpoint from
+  save/online_LSTM_bk-hp_bk-TUS_LSTM_complete/
+and runs it on one .h5 file.
 
-Outputs are saved to infer_baseline_output/:
+Outputs are saved to infer_LSTM_baseline_output/:
   - predicted_gaps.npy   : (N-1, 6)  [tx, ty, tz, rx, ry, rz]
   - predicted_series.npy : (N,   3, 3) world-mm frame positions
   - gt_series.npy        : (N,   3, 3) ground-truth series
@@ -15,10 +15,13 @@ Outputs are saved to infer_baseline_output/:
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+_PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _PROJ_ROOT not in sys.path:
+    sys.path.insert(0, _PROJ_ROOT)
 
 import matplotlib
-# matplotlib.use('Agg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -27,54 +30,62 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import h5py
-import trial.my_utils.functions as my_utils
-import pyvista as pv
-from utils.plot_functions import (
-    data_pairs_adjacent, transform_t2t, read_calib_matrices, add_series_rects,
-)
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
-# H5_PATH    = "/media/wu/Extreme SSD/datasets/11178509/train_part1/001/LH_Par_L_PtD.h5"
-# H5_PATH    = "../../data/frames_transfs/002/LH_Par_L_PtD.h5"
-H5_PATH     = "../../data/frames_transfs/001/LH_Per_L_DtP.h5"
+H5_PATH    = "/media/wu/Extreme SSD/datasets/11178509/train_part1/049/LH_Par_L_PtD.h5"
+# H5_PATH     = "../../data/frames_transfs/001/LH_Per_L_DtP.h5"
 CALIB_PATH = "../../data/calib_matrix.csv"
-CKPT_PATH  = "../../save/online_baseline_bk-hp_bk-TUS_complete/online_baseline_bk_backbone_230.pth"
-OUT_DIR    = "../../infer_baseline_output"
-FILENAME_CALIB = '/home/wu/Documents/projects/cloned_repositories/RecON/datasets/calib_matrix.csv'
+CKPT_PATH  = "../../save/online_LSTM_bk-hp_bk-TUS_LSTM_complete/online_LSTM_bk_backbone_50.pth"
+OUT_DIR    = "../../infer_LSTM_baseline_output"
 
 # ── Model config (must match training) ────────────────────────────────────────
 IN_PLANES   = 2   # two consecutive frames (channel=2)
 NUM_CLASSES = 6   # target.elements(15) - 9 = 6 gaps (tx,ty,tz,rx,ry,rz)
 IMG_H, IMG_W = 480, 640
 BATCH_PAIRS  = 1  # number of frame-pairs to process at once (memory budget)
-down_ratio = 1
+
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backbone (copy of the class in models/online_baseline_backbone.py)
+# Backbone (matches models/online_LSTM_backbone.py)
 # ─────────────────────────────────────────────────────────────────────────────
 import timm
+import models
 
 class Backbone(nn.Module):
     def __init__(self, in_planes, num_classes):
         super().__init__()
-        self.efficientnet_b1 = timm.create_model(
-            'efficientnet_b1', pretrained=False,
-            in_chans=in_planes, num_classes=num_classes
+        self.resnet = timm.create_model(
+            'resnet18', pretrained=False,
+            in_chans=in_planes, num_classes=0, global_pool=''
+        )
+        self.lstm = models.layers.convolutional_rnn.Conv2dLSTM(
+            512, 512, kernel_size=3, batch_first=True
         )
         self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(512, num_classes)
 
-    def forward(self, x):
-        """x: (B, T, C, H, W)  →  out: (B, T, num_classes)"""
+    def forward(self, x, return_feature=False):
+        """x: (B, T, C, H, W)  →  out: (B, T, num_classes), feature"""
         b, t, c, h, w = x.shape
         x = (x - torch.mean(x, dim=[3, 4], keepdim=True)) / \
             (torch.std(x, dim=[3, 4], keepdim=True) + 1e-6)
         x = x.view(b * t, c, h, w)
-        x = self.efficientnet_b1(x)           # (B*T, num_classes)
-        x = x.view(b, t, *x.shape[1:])        # (B, T, num_classes)
-        return x
+        x = self.resnet(x)
+        x = x.view(b, t, *x.shape[1:])
+        if return_feature:
+            f = self.avg(x)
+            f = f.view(f.size(0), f.size(1), -1)
+        else:
+            f = None
+        x = self.lstm(x)[0]
+        x = self.avg(x)
+        x = x.view(x.size(0), x.size(1), -1)
+        x = self.fc(x)
+        return x, f
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,51 +226,8 @@ def main():
     with h5py.File(H5_PATH, 'r') as f:
         frames_np = f['frames'][()]    # (N, H_orig, W_orig) uint8
         tforms_np = f['tforms'][()]    # (N, 4, 4) float32
-
-    H, W = frames_np.shape[1], frames_np.shape[2]
     N, H_orig, W_orig = frames_np.shape
     print(f"  frames: {frames_np.shape}, tforms: {tforms_np.shape}")
-
-    source_0 = frames_np
-
-    ######################################################
-    ### Compute T_combined: pixel [u,v,0,1] → world mm ###
-    ######################################################
-
-    data_pairs = data_pairs_adjacent(frames_np.shape[0])
-    T_each_frame2frame0 = transform_t2t(
-        torch.from_numpy(tforms_np),
-        torch.linalg.inv(torch.from_numpy(tforms_np)),
-        data_pairs,
-    )
-
-    T_calib_scale, T_calib_R_T, T_calib = read_calib_matrices(FILENAME_CALIB)
-    T_calib_inv_R_T = torch.linalg.inv(T_calib_R_T)
-
-    scale_w = float(T_calib_scale[0, 0])  # u → W dimension
-    scale_h = float(T_calib_scale[1, 1])  # v → H dimension
-
-    T_combined = torch.matmul(
-        T_calib_inv_R_T.unsqueeze(0),
-        torch.matmul(T_each_frame2frame0, T_calib.unsqueeze(0)),
-    )  # (N, 4, 4)
-
-    #############################################################################
-    ### Build series (N, 3, 3): [centre, lower-left, lower-right] in world mm ###
-    #############################################################################
-
-    pixel_pts = torch.tensor(
-        [
-            [W / 2.0, H / 2.0, 0.0, 1.0],  # centre
-            [1.0, float(H), 0.0, 1.0],  # lower-left
-            [float(W), float(H), 0.0, 1.0],  # lower-right
-        ],
-        dtype=T_combined.dtype,
-    ).T  # (4, 3)
-
-    N = T_combined.shape[0]
-    world_pts = torch.bmm(T_combined, pixel_pts.unsqueeze(0).expand(N, 4, 3))  # (N, 4, 3)
-    series = world_pts[:, :3, :].permute(0, 2, 1)  # (N, 3, 3)
 
     # 2. Build ground-truth series ─────────────────────────────────────────────
     print("Building GT series from calibration ...")
@@ -296,7 +264,7 @@ def main():
         for start in range(0, N - 1, BATCH_PAIRS):
             end = min(start + BATCH_PAIRS, N - 1)
             batch = pairs[start:end].unsqueeze(0).to(device)  # (1, end-start, 2, H, W)
-            out = backbone(batch)                              # (1, end-start, 6)
+            out, _ = backbone(batch)                          # (1, end-start, 6)
             all_gaps.append(out.squeeze(0).cpu())             # (end-start, 6)
 
     fake_gaps = torch.cat(all_gaps, dim=0)   # (N-1, 6)
@@ -313,165 +281,23 @@ def main():
     )                                                          # (N, 3, 3)
     print(f"  predicted series shape: {pred_series.shape}")
 
-    scale_w = float(T_calib_scale[0, 0])  # u → W dimension
-    scale_h = float(T_calib_scale[1, 1])  # v → H dimension
+    # 8. Save outputs ──────────────────────────────────────────────────────────
+    np.save(os.path.join(OUT_DIR, "predicted_gaps.npy"),   fake_gaps.numpy())
+    np.save(os.path.join(OUT_DIR, "predicted_series.npy"), pred_series.numpy())
+    np.save(os.path.join(OUT_DIR, "gt_series.npy"),        gt_series.numpy())
+    print(f"\nResults saved to '{OUT_DIR}/':")
+    print(f"  predicted_gaps.npy   {fake_gaps.shape}  (tx,ty,tz,rx,ry,rz per pair)")
+    print(f"  predicted_series.npy {pred_series.shape}  (world-mm frame positions)")
+    print(f"  gt_series.npy        {gt_series.shape}  (ground-truth)")
 
-    ##################
-    ### Downsample ###
-    ##################
+    # 9. Quick sanity stats ────────────────────────────────────────────────────
+    dist_err = torch.norm(
+        pred_series[:, 0, :] - gt_series[:, 0, :], dim=-1
+    ).mean().item()
+    print(f"\nMean center-point distance error: {dist_err:.4f} mm")
 
-    source_0 = torch.from_numpy(source_0.astype(np.float32) / 255.0)  # (N, H, W)
-
-    mat_scale = torch.eye(4, dtype=torch.float32, device=device)
-    mat_scale[0, 0] = down_ratio
-    mat_scale[1, 1] = down_ratio
-    mat_scale[2, 2] = down_ratio
-
-    source_down = F.interpolate(
-        source_0.unsqueeze(1), scale_factor=down_ratio, mode='bilinear', align_corners=False
-    ).squeeze(1)  # (N, H*dr, W*dr)
-
-    ##############################
-    ### Reconstruct 3-D volume ###
-    ##############################
-    volume, bias = my_utils.reco(source_down.to(device), pred_series.to(device), scale_w, scale_h, mat_scale)
-    # volume, bias = my_utils.reco(source_down.to(device), series.to(device), scale_w, scale_h, mat_scale)
-
-    volume = volume.cpu()
-    bias = bias.cpu()
-
-    series_biased = series - bias
-    volume_up = F.interpolate(volume.unsqueeze(0).unsqueeze(0), scale_factor=1 / down_ratio).squeeze(0).squeeze(0)
-
-    ########################
-    ### Slice 3-D volume ###
-    ### Random rigid transformation preserving shape and center
-    ########################
-    idx_start_point = 300
-    s = series[idx_start_point]   # (3, 3): [center, lower-left, lower-right]
-    C  = s[0]
-    LL = s[1]
-    LR = s[2]
-    UL = 2 * C - LR  # upper-left (from rectangle symmetry)
-
-    # Frame basis vectors
-    e_x_raw = LR - LL
-    w_size   = torch.norm(e_x_raw)
-    e_x      = e_x_raw / w_size       # horizontal axis (left → right)
-    w_half   = w_size / 2
-
-    h_vec  = UL - LL                  # = 2*C - LR - LL
-    h_size = torch.norm(h_vec)
-    e_y    = h_vec / h_size           # vertical axis (bottom → top / depth)
-    h_half = h_size / 2
-
-    # Random rigid rotation via Rodrigues' formula:
-    # random unit axis + random angle in [0, 2π) — center C and dimensions unchanged
-    rand_axis  = F.normalize(torch.randn(3, dtype=e_x.dtype), dim=0)
-    rand_angle = torch.rand(1).item() * 2 * torch.pi
-    cos_t = torch.cos(torch.tensor(rand_angle, dtype=e_x.dtype))
-    sin_t = torch.sin(torch.tensor(rand_angle, dtype=e_x.dtype))
-
-    def _rot(v):
-        return cos_t * v + sin_t * torch.linalg.cross(rand_axis, v) + (1 - cos_t) * torch.dot(v, rand_axis) * rand_axis
-
-    new_e_x = _rot(e_x)
-    new_e_y = _rot(e_y)
-
-    LL_new  = C - w_half * new_e_x - h_half * new_e_y
-    LR_new  = C + w_half * new_e_x - h_half * new_e_y
-
-    rotated_series = torch.stack([C, LL_new, LR_new]).unsqueeze(0)  # (1, 3, 3)
-    rotated_slicer_biased = rotated_series - bias          # align with volume coords
-
-    # Get slices from the 3D volume for all rotated frames at once
-    rot_slices = my_utils.get_slice(
-        volume_up,
-        rotated_slicer_biased,
-        source.shape[-2:],
-        scale_h=scale_h,
-        scale_w=scale_w,
-    )  # (1, n_steps, 1, H, W)
-    rot_slices = rot_slices.squeeze(0, 2).cpu()            # (n_steps, H, W)
-
-    ########################
-    ### Visualise slices ###
-    ########################
-    deg_label = f"{rand_angle * 180 / torch.pi:.1f}°"
-
-    fig, axes = plt.subplots(1, 2, figsize=(5, 3), squeeze=False)
-    fig.suptitle(f"Random rigid rotation: {deg_label} around random axis")
-
-    orig = source_0[idx_start_point]
-    axes[0, 0].imshow(orig, cmap="gray", vmin=0, vmax=1)
-    axes[0, 0].set_title("original frame", fontsize=8)
-    axes[0, 0].axis("off")
-
-    axes[0, 1].imshow(rot_slices[0], cmap="gray", vmin=0, vmax=1)
-    axes[0, 1].set_title(deg_label, fontsize=8)
-    axes[0, 1].axis("off")
-
-    plt.tight_layout()
-    plt.show()
-
-    ########################################
-    ### 3D volume rendering with PyVista ###
-    ########################################
-    plotter = pv.Plotter(title=f'Random rigid rotation: {deg_label} around random axis')
-
-    vol_np = volume_up.numpy()
-    grid = pv.ImageData()
-    grid.dimensions = np.array(vol_np.shape)
-    grid.spacing = (1, 1, 1)
-    grid.point_data["Intensity"] = vol_np.flatten(order="F")
-    plotter.add_volume(grid, scalars="Intensity", cmap="bone", opacity="sigmoid")
-
-    # 0°  = transverse frame (red), 90° = longitudinal frame (blue)
-    add_series_rects(plotter, rotated_slicer_biased[0:1],  indices=[0], colors='red',  opacity=1)
-    add_series_rects(plotter, rotated_slicer_biased[-1:],  indices=[0], colors='blue', opacity=1)
-
-    plotter.show_axes()
-    plotter.set_background('black')
-    plotter.show()
-
-    # ########################################
-    # ### 3D volume rendering with PyVista ###
-    # ########################################
-    #
-    # plotter = pv.Plotter(title='Series rectangles')
-    #
-    # vol_np = volume_up.numpy()
-    # grid = pv.ImageData()
-    # grid.dimensions = np.array(vol_np.shape)
-    # grid.spacing = (1, 1, 1)
-    # grid.point_data["Intensity"] = vol_np.flatten(order="F")
-    # plotter.add_volume(grid, scalars="Intensity", cmap="bone", opacity="sigmoid")
-    #
-    # # add_series_rects(plotter, series_biased, indices=[0, 300, N - 1], colors='red', opacity=1, frames=source)
-    # # add_series_rects(plotter, slicer_biased, indices=[0], colors='blue', opacity=1)
-    #
-    # plotter.show_axes()
-    # plotter.set_background('black')
-    # plotter.show()
-
-    #
-    # # 8. Save outputs ──────────────────────────────────────────────────────────
-    # np.save(os.path.join(OUT_DIR, "predicted_gaps.npy"),   fake_gaps.numpy())
-    # np.save(os.path.join(OUT_DIR, "predicted_series.npy"), pred_series.numpy())
-    # np.save(os.path.join(OUT_DIR, "gt_series.npy"),        gt_series.numpy())
-    # print(f"\nResults saved to '{OUT_DIR}/':")
-    # print(f"  predicted_gaps.npy   {fake_gaps.shape}  (tx,ty,tz,rx,ry,rz per pair)")
-    # print(f"  predicted_series.npy {pred_series.shape}  (world-mm frame positions)")
-    # print(f"  gt_series.npy        {gt_series.shape}  (ground-truth)")
-    #
-    # # 9. Quick sanity stats ────────────────────────────────────────────────────
-    # dist_err = torch.norm(
-    #     pred_series[:, 0, :] - gt_series[:, 0, :], dim=-1
-    # ).mean().item()
-    # print(f"\nMean center-point distance error: {dist_err:.4f} mm")
-    #
-    # # 10. Visualize ────────────────────────────────────────────────────────────
-    # visualize(gt_series.numpy(), pred_series.numpy(), OUT_DIR)
+    # 10. Visualize ────────────────────────────────────────────────────────────
+    visualize(gt_series.numpy(), pred_series.numpy(), OUT_DIR)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,6 +339,13 @@ def visualize(gt, pred, out_dir):
     gt_center   = gt[:, 0, :]    # (N, 3)
     pred_center = pred[:, 0, :]
 
+    # Unified axis range so X, Y, Z all use the same scale across every subplot
+    all_pts = np.vstack([gt_center, pred_center])
+    g_min = all_pts.min()
+    g_max = all_pts.max()
+    pad   = (g_max - g_min) * 0.05
+    g_lim = (g_min - pad, g_max + pad)
+
     # ── Figure 1: 3D trajectories ─────────────────────────────────────────────
     fig = plt.figure(figsize=(14, 6))
     t = np.linspace(0, 1, n)
@@ -544,7 +377,9 @@ def visualize(gt, pred, out_dir):
         ax.set_zlabel('Z (mm)', labelpad=4)
         ax.set_title(title, fontsize=10)
         ax.view_init(elev=elev, azim=azim)
-        _set_axes_equal_3d(ax)
+        ax.set_xlim3d(*g_lim)
+        ax.set_ylim3d(*g_lim)
+        ax.set_zlim3d(*g_lim)
 
         if col == 0:
             ax.legend(handles=[
@@ -583,7 +418,9 @@ def visualize(gt, pred, out_dir):
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.legend(fontsize=8)
-        ax.set_aspect('equal', adjustable='datalim')
+        ax.set_xlim(g_lim)
+        ax.set_ylim(g_lim)
+        ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
 
     for col, (ai, lbl, col_err) in enumerate(zip(

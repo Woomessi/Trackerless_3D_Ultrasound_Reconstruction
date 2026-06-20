@@ -1,0 +1,21 @@
+{
+  "name": "Online_Finetuning_LSTM_Edge_Backbone",
+  "pretrained_weight": "/media/wu/Extreme SSD/online_LSTM_edge_bk-hp_bk-TUS_LSTM_edge_complete/online_LSTM_edge_bk_backbone_21.pth",
+  "max_train_frames": 64,
+  "backbone_chunk_size": 8,
+  "down_ratio": 1,
+  "criterion_scale": 0.5,
+  "dense_grad": true,
+  "backbone_input_scale": 1,
+  "grad_clip_norm": 0.5,
+  "max_reco_voxels": 500000000,
+  "max_reco_attempts": 5,
+  "weight_loss1":            0.0,
+  "weight_loss_rot":         0.0,
+  "weight_loss_jagged":      0.0,
+  "weight_loss_ssim":        0.0,
+  "weight_loss_consistency": 1.0,
+  "rotation_max_angle":      0.06,
+  "consistency_angle":       0.035,
+  "jagged_mask_thresh":      0.02
+}

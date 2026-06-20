@@ -281,12 +281,14 @@ class Online_Finetuning_Backbone(models.BaseModel):
         keeping _count aligned with every loss array in train_return_hook.
         """
         keys = ['loss_slice']
-        if float(getattr(self.cfg, 'weight_loss_rot',    0.0)) > 0:
+        if float(getattr(self.cfg, 'weight_loss_rot',         0.0)) > 0:
             keys.append('loss_rot')
-        if float(getattr(self.cfg, 'weight_loss_jagged', 0.0)) > 0:
+        if float(getattr(self.cfg, 'weight_loss_jagged',      0.0)) > 0:
             keys.append('loss_jagged')
-        if float(getattr(self.cfg, 'weight_loss_ssim',   0.0)) > 0:
+        if float(getattr(self.cfg, 'weight_loss_ssim',        0.0)) > 0:
             keys.append('loss_ssim')
+        if float(getattr(self.cfg, 'weight_loss_consistency', 0.0)) > 0:
+            keys.append('loss_consistency')
         return keys
 
     # ------------------------------------------------------------------
@@ -763,6 +765,18 @@ class Online_Finetuning_Backbone(models.BaseModel):
         )                                                  # (1, 1, 1, H_c, W_c)
         slice_vol  = slice_vol.squeeze(0)                  # (1, 1, H_c, W_c)
 
+        # Content threshold: reject near-empty slices (volume boundary artefacts)
+        # that would produce a trivially low loss with no useful gradient signal.
+        # slice_content_thresh  — pixel value floor (default 0.02, disabled when 0)
+        # slice_min_content_ratio — minimum fraction of above-threshold pixels
+        #                           (default 0.05, disabled when 0)
+        slice_content_thresh    = float(getattr(self.cfg, 'slice_content_thresh',    0.0))
+        slice_min_content_ratio = float(getattr(self.cfg, 'slice_min_content_ratio', 0.0))
+        if slice_content_thresh > 0 and slice_min_content_ratio > 0:
+            content_ratio = (slice_vol.detach() > slice_content_thresh).float().mean().item()
+            if content_ratio < slice_min_content_ratio:
+                return None
+
         # Downsample real image to match the reduced slice resolution
         real_small = F.interpolate(
             real_image, size=(H_c, W_c), mode='bilinear', align_corners=False,
@@ -810,6 +824,16 @@ class Online_Finetuning_Backbone(models.BaseModel):
         if weight_loss_ssim > 0:
             losses['loss_ssim'] = self._volume_ssim_loss(
                 volume, bias_origin, fake_series, H, W, crit_scale, weight_loss_ssim,
+            )
+
+        # ── 7. Loss 5: slice consistency (from LSTM-edge variant) ─────────────
+        # Compares the volume slice at gt_pos with a slice at a slightly rotated
+        # probe position.  A well-reconstructed volume should yield similar slices
+        # for nearby orientations; staircase artefacts produce large differences.
+        weight_loss_consistency = float(getattr(self.cfg, 'weight_loss_consistency', 0.0))
+        if weight_loss_consistency > 0:
+            losses['loss_consistency'] = self._slice_consistency_loss(
+                volume, bias_origin, gt_pos, slice_vol, H, W, H_c, W_c, crit_scale,
             )
 
         return losses
@@ -964,7 +988,7 @@ class Online_Finetuning_Backbone(models.BaseModel):
         """
         weight_loss_rot    = float(getattr(self.cfg, 'weight_loss_rot',    0.0))
         weight_loss_jagged = float(getattr(self.cfg, 'weight_loss_jagged', 0.0))
-        max_angle          = float(getattr(self.cfg, 'rotation_max_angle', torch.pi / 2))
+        max_angle          = float(getattr(self.cfg, 'rotation_max_angle', 0.02))
 
         # ── Frame axes from gt_pos ─────────────────────────────────────
         axis = my_utils.get_axis(gt_pos.float())  # (1, 3, 3) rows: ax_x, ax_y, ax_z
@@ -1016,7 +1040,21 @@ class Online_Finetuning_Backbone(models.BaseModel):
         if weight_loss_jagged > 0:
             drow = (slice_rot[:, :, 1:, :] - slice_rot[:, :, :-1, :]).abs()  # (1,1,H_c-1,W_c)
             dcol = (slice_rot[:, :, :, 1:] - slice_rot[:, :, :, :-1]).abs()  # (1,1,H_c,W_c-1)
-            losses['loss_jagged'] = (drow.mean() + dcol.mean()) * weight_loss_jagged
+            jagged_mask_thresh = float(getattr(self.cfg, 'jagged_mask_thresh', 0.0))
+            if jagged_mask_thresh > 0:
+                # Only compute jaggedness at pixels with valid content (non-boundary).
+                # Uses relu(drow - dcol) so the loss only fires when horizontal
+                # staircase artefacts dominate over natural vertical variation.
+                content   = (slice_rot.detach() > jagged_mask_thresh)
+                drow_mask = content[:, :, 1:, :] & content[:, :, :-1, :]
+                dcol_mask = content[:, :, :, 1:] & content[:, :, :, :-1]
+                if drow_mask.any() and dcol_mask.any():
+                    losses['loss_jagged'] = (
+                        F.relu(drow[drow_mask].mean() - dcol[dcol_mask].mean().detach())
+                        * weight_loss_jagged
+                    )
+            else:
+                losses['loss_jagged'] = (drow.mean() + dcol.mean()) * weight_loss_jagged
 
         # # ╔══════════════════════════════════════════════════════════════════╗
         # # ║  DEBUG: rotation-consistency visualisation                      ║
@@ -1036,6 +1074,239 @@ class Online_Finetuning_Backbone(models.BaseModel):
         # # ╚══════════════════════════════════════════════════════════════════╝
 
         return losses
+
+    # ------------------------------------------------------------------
+    # Slice Consistency Loss helper (Loss 5 — from LSTM-edge variant)
+    # ------------------------------------------------------------------
+
+    def _slice_consistency_loss(
+        self, volume, bias_origin, gt_pos, slice_orig, H, W, H_c, W_c, crit_scale,
+    ):
+        """Loss 5: spatial consistency via slightly rotated probe-position slices.
+
+        Extracts a volume slice at a small random rotation from gt_pos and
+        compares it to the original slice at gt_pos.  A spatially consistent
+        reconstruction should yield similar images for nearby probe orientations.
+        Trajectory errors that cause staircase artefacts in the volume will
+        produce large differences between the two slices.
+
+        Config keys
+        ~~~~~~~~~~~
+        weight_loss_consistency  float  loss weight (default 0.0; set > 0 to enable)
+        consistency_angle        float  fixed tilt magnitude in radians (default 0.01);
+                                        direction is randomised ±each step
+        consistency_loss_fn      str    'l1' (default) or 'ssim'
+
+        Args:
+            volume       (D, H', W')       reconstructed 3-D volume
+            bias_origin  (3,)              differentiable vol-mm origin
+            gt_pos       (1, 3, 3)         GT world-mm position (detached)
+            slice_orig   (1, 1, H_c, W_c) volume slice at gt_pos (already computed)
+            H, W         int               full-resolution image dims
+            H_c, W_c     int               criterion-scale dims
+            crit_scale   float             criterion downscale factor
+
+        Returns:
+            scalar Tensor  weighted consistency loss
+        """
+        weight = float(getattr(self.cfg, 'weight_loss_consistency', 0.0))
+
+        axis = my_utils.get_axis(gt_pos.float())
+        ax_x = axis[0, 0]
+        ax_y = axis[0, 1]
+        ax_z = axis[0, 2]
+
+        angle = float(getattr(self.cfg, 'consistency_angle', 0.01))
+        if torch.rand(1).item() < 0.5:
+            angle = -angle
+
+        dev, dt = gt_pos.device, gt_pos.dtype
+        cos_t    = torch.tensor(angle, device=dev, dtype=dt).cos()
+        sin_t    = torch.tensor(angle, device=dev, dtype=dt).sin()
+        ax_y_rot = cos_t * ax_y + sin_t * ax_z
+
+        half_w = (W - 1) / 2.0 * self.scale_w
+        half_h = (H - 1) / 2.0 * self.scale_h
+        center = gt_pos[0, 0]
+        ll_rot = center - ax_x * half_w - ax_y_rot * half_h
+        lr_rot = center + ax_x * half_w - ax_y_rot * half_h
+        gt_pos_rot = torch.stack([center, ll_rot, lr_rot]).unsqueeze(0)  # (1, 3, 3)
+
+        gt_pos_rot_vol = gt_pos_rot - bias_origin.view(1, 1, 3)
+
+        slice_rot = my_utils.get_slice(
+            volume, gt_pos_rot_vol, (H_c, W_c),
+            scale_h=self.scale_h / crit_scale,
+            scale_w=self.scale_w / crit_scale,
+        ).squeeze(0)  # (1, 1, H_c, W_c)
+
+        use_ssim = str(getattr(self.cfg, 'consistency_loss_fn', 'l1')).lower() == 'ssim'
+        if use_ssim:
+            ssim_val = _batch_ssim(slice_orig, slice_rot)
+            loss_consistency = (1.0 - ssim_val) * weight
+        else:
+            loss_consistency = F.l1_loss(slice_orig, slice_rot) * weight
+
+        # # ╔══════════════════════════════════════════════════════════════════╗
+        # # ║  DEBUG: slice-consistency visualisation — comment out for train ║
+        # # ╚══════════════════════════════════════════════════════════════════╝
+        # self._debug_visualise_slice_consistency(
+        #     volume         = volume,
+        #     bias           = bias_origin.detach(),
+        #     gt_pos         = gt_pos,
+        #     gt_pos_rot     = gt_pos_rot,
+        #     ax_x           = ax_x,
+        #     slice_orig     = slice_orig.detach(),
+        #     slice_rot      = slice_rot.detach(),
+        #     angle          = angle,
+        #     loss_consistency = loss_consistency,
+        # )
+        # # ╚══════════════════════════════════════════════════════════════════╝
+
+        return loss_consistency
+
+    # ------------------------------------------------------------------
+    # Debug visualisation for slice consistency loss (Loss 5)
+    # ------------------------------------------------------------------
+
+    def _debug_visualise_slice_consistency(
+        self,
+        volume,
+        bias,
+        gt_pos,
+        gt_pos_rot,
+        ax_x,
+        slice_orig,
+        slice_rot,
+        angle,
+        loss_consistency=None,
+    ):
+        """Visualise Loss 5 (slice consistency): original vs rotated probe slice.
+
+        Shows two blocking windows (close each to continue):
+
+        **Window 1 — Matplotlib** (3 panels):
+        ┌──────────────┬──────────────┬──────────────┐
+        │ slice_orig   │  slice_rot   │ |orig - rot| │
+        │ (gt_pos)     │ (rotated θ)  │  diff map    │
+        └──────────────┴──────────────┴──────────────┘
+
+        **Window 2 — PyVista** (3-D):
+        • Reconstructed volume (bone colormap, sigmoid opacity)
+        • Original GT frame — green quad with slice_orig texture
+        • Rotated frame     — cyan quad with slice_rot texture
+        • Rotation axis     — red line through center along ax_x
+        • Shared center     — yellow sphere
+
+        Args:
+            volume          (D, H', W')        reconstructed volume (no grad)
+            bias            (3,)               world-mm origin offset (detached)
+            gt_pos          (1, 3, 3)          original GT position (world-mm)
+            gt_pos_rot      (1, 3, 3)          rotated position (world-mm)
+            ax_x            (3,)               horizontal in-plane axis (unit vec)
+            slice_orig      (1, 1, H_c, W_c)  volume slice at gt_pos   (detached)
+            slice_rot       (1, 1, H_c, W_c)  volume slice at rotated pos (detached)
+            angle           float              rotation angle used (radians)
+            loss_consistency Tensor | None     weighted Loss 5 value (for display)
+        """
+        import matplotlib.pyplot as plt
+        import pyvista as pv
+        from utils.plot_functions import add_series_rects
+
+        orig_np  = slice_orig.squeeze().cpu().float().numpy()   # (H_c, W_c)
+        rot_np   = slice_rot.squeeze().cpu().float().numpy()    # (H_c, W_c)
+        diff_np  = np.abs(orig_np - rot_np)
+
+        angle_deg = float(np.degrees(angle))
+        cons_str  = (
+            f'loss_consistency={loss_consistency.item():.4f}'
+            if loss_consistency is not None else 'loss_consistency=disabled'
+        )
+
+        # ══════════════════════════════════════════════════════════════
+        # Window 1 — Matplotlib: 2-D slice comparison
+        # ══════════════════════════════════════════════════════════════
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        axes[0].imshow(orig_np, cmap='gray', vmin=0, vmax=1, aspect='auto')
+        axes[0].set_title('slice_orig\n(volume at GT pose)', fontsize=10)
+        axes[0].axis('off')
+
+        axes[1].imshow(rot_np, cmap='gray', vmin=0, vmax=1, aspect='auto')
+        axes[1].set_title(f'slice_rot\n(rotated θ={angle_deg:+.2f}°)', fontsize=10)
+        axes[1].axis('off')
+
+        vmax_diff = max(float(diff_np.max()), 1e-6)
+        im_d = axes[2].imshow(diff_np, cmap='hot', vmin=0, vmax=vmax_diff, aspect='auto')
+        axes[2].set_title(f'|orig − rot|\nmax={vmax_diff:.3f}   {cons_str}', fontsize=10)
+        axes[2].axis('off')
+        plt.colorbar(im_d, ax=axes[2], fraction=0.046, pad=0.02)
+
+        fig.suptitle(
+            f'DEBUG slice consistency loss   θ={angle_deg:+.2f}°   {cons_str}',
+            fontsize=12,
+        )
+        plt.tight_layout()
+        plt.show()   # ← blocks until closed
+
+        # ══════════════════════════════════════════════════════════════
+        # Window 2 — PyVista: 3-D volume + frame positions
+        # ══════════════════════════════════════════════════════════════
+        vol_np       = volume.detach().cpu().float().numpy()
+        bias_cpu     = bias.cpu()
+        ax_x_np      = ax_x.detach().cpu().float().numpy()
+
+        gt_pos_vol     = (gt_pos.cpu()     - bias_cpu).float().numpy()   # (1, 3, 3)
+        gt_pos_rot_vol = (gt_pos_rot.cpu() - bias_cpu).float().numpy()   # (1, 3, 3)
+        center_vol     = gt_pos_vol[0, 0]
+
+        ll_vol = gt_pos_vol[0, 1]; lr_vol = gt_pos_vol[0, 2]
+        half_w = float(np.linalg.norm(lr_vol - ll_vol)) / 2.0
+        line_a = center_vol - ax_x_np * half_w
+        line_b = center_vol + ax_x_np * half_w
+
+        orig_u8 = (np.clip(orig_np, 0, 1) * 255).astype(np.uint8)
+        rot_u8  = (np.clip(rot_np,  0, 1) * 255).astype(np.uint8)
+
+        pv_title = f'DEBUG slice consistency   θ={angle_deg:+.2f}°   {cons_str}'
+        plotter  = pv.Plotter(title=pv_title)
+
+        grid = pv.ImageData()
+        grid.dimensions = np.array(vol_np.shape)
+        grid.spacing    = (1.0, 1.0, 1.0)
+        grid.point_data['Intensity'] = vol_np.flatten(order='F')
+        plotter.add_volume(grid, scalars='Intensity', cmap='bone', opacity='sigmoid')
+
+        add_series_rects(
+            plotter, gt_pos_vol, indices=[0],
+            colors='green', opacity=0.15, edge_width=3,
+            frames=orig_u8[np.newaxis],
+        )
+        add_series_rects(
+            plotter, gt_pos_rot_vol, indices=[0],
+            colors='cyan', opacity=0.15, edge_width=3,
+            frames=rot_u8[np.newaxis],
+        )
+
+        line_pts  = np.array([line_a, line_b], dtype=np.float32)
+        line_mesh = pv.Spline(line_pts, n_points=2)
+        plotter.add_mesh(line_mesh, color='red', line_width=4)
+
+        plotter.add_points(
+            center_vol.reshape(1, 3).astype(np.float32),
+            color='yellow', point_size=12, render_points_as_spheres=True,
+        )
+        plotter.add_text(
+            f'green  = original GT frame (slice_orig texture)\n'
+            f'cyan   = rotated frame θ={angle_deg:+.2f}° (slice_rot texture)\n'
+            f'red    = rotation axis (ax_x)\n'
+            f'yellow = shared center point\n'
+            f'{cons_str}',
+            position='upper_left', font_size=9, color='white',
+        )
+        plotter.show_axes()
+        plotter.set_background('black')
+        plotter.show()   # ← blocks until closed
 
     # ------------------------------------------------------------------
     # Debug visualisation for rotation consistency loss

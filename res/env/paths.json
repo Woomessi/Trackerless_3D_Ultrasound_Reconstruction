@@ -3,7 +3,7 @@
   "dataset_cfgs_folder": "res/datasets",
   "model_cfgs_folder": "res/models",
   "run_cfgs_folder": "res/run",
-  "save_folder": "save",
+  "save_folder": "/media/wu/Extreme SSD",
   "check_file": "_checkpoint.pth",
   "loss_file": "_loss.npy",
   "predict_file": "_predict.npy",

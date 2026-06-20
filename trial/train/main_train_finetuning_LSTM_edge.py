@@ -1,42 +1,28 @@
-"""CPU version of the scan-level self-supervised fine-tuning training script.
+"""GPU version of scan-level self-supervised fine-tuning for the LSTM-edge backbone.
 
-Identical to main_complete_finetuning_train.py except:
+Fine-tunes the model produced by main_train_LSTM_edge_backbone.py using the
+self-supervised reconstruction loss from Online_Finetuning_LSTM_Edge_Backbone.
 
-1. gpus='cpu'  — forces torch.device('cpu') throughout the framework
-   (Run._set_gpus sets CUDA_VISIBLE_DEVICES='' so torch.cuda.is_available()
-   returns False, which propagates automatically to TUS_complete_scan.cfg.device
-   and to every model / tensor allocation via self.device).
-
-2. No PYTORCH_CUDA_ALLOC_CONF env-var — the GPU memory-fragmentation workaround
-   is irrelevant on CPU.
-
-3. torch.cuda.empty_cache() calls are replaced by gc.collect() — on CPU the
-   Python garbage-collector serves the same "release unused tensors" purpose,
-   while empty_cache() is technically a no-op without CUDA but adds unnecessary
-   PyTorch CUDA-initialisation overhead the first time it is called.
-
-Performance note
-----------------
-CPU training is MUCH slower than GPU (typically 50–200×).
-For feasible runtimes the default config switches to:
-    dense_grad  = false   (sparse-gradient path; avoids recomputing reco()
-                           during backward — the largest CPU bottleneck)
-    max_train_frames = 8  (halves the number of backbone forward passes
-                           and the reco() frame count per training step)
-
-Both values can be overridden in res/models/online_finetune_bk_cpu.json.
+Configs used
+------------
+Model   : res/models/online_finetune_LSTM_edge_bk.json
+          (pretrained_weight points to the LSTM-edge backbone checkpoint)
+Dataset : res/datasets/TUS_LSTM_edge_complete_scan.json
+          (TUS_complete_scan with channel=4 for the 4-channel backbone input)
+Run     : res/run/hp_finetune_bk.json
 
 Usage
 -----
-    python trial/train/main_complete_finetuning_train_cpu.py
+    python trial/train/main_train_finetuning_LSTM_edge.py
 """
 
-import gc
 import glob
 import os
 import re
 import time
 
+import matplotlib
+# matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -46,38 +32,30 @@ import datasets
 import models
 import utils
 
-# ── CPU-friendly torch settings ───────────────────────────────────────────────
-# Use all available logical cores for intra-op parallelism (Conv, matmul …).
-# Over-subscribing rarely helps; let PyTorch auto-detect.
-torch.set_num_threads(torch.get_num_threads())
-# cuDNN flags are ignored on CPU; set them anyway for consistency with the
-# GPU script in case the config is shared.
-torch.backends.cudnn.enabled      = False
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
+torch.backends.cudnn.enabled      = True
 torch.backends.cudnn.benchmark    = False
 torch.backends.cudnn.deterministic = True
 
 
 def _empty_cache():
-    """CPU counterpart of torch.cuda.empty_cache(): release Python-managed memory."""
-    gc.collect()
+    torch.cuda.empty_cache()
 
 
 class Main(object):
 
     def __init__(self):
         self.model_cfg = configs.BaseConfig(
-            '/home/wu/Documents/projects/my_projects/Trackerless_3D_Ultrasound_Reconstruction/res/models/online_finetune_bk_cpu.json'
+            '/home/wu/Documents/projects/my_projects/Trackerless_3D_Ultrasound_Reconstruction/res/models/online_finetune_LSTM_edge_bk.json'
         )
-        # gpus='cpu' → Run._set_gpus sets CUDA_VISIBLE_DEVICES=''
-        #             → torch.cuda.is_available() == False
-        #             → self.device = torch.device('cpu')
         self.run_cfg = configs.Run(
             '/home/wu/Documents/projects/my_projects/Trackerless_3D_Ultrasound_Reconstruction/res/run/hp_finetune_bk.json',
-            gpus='cpu',
+            gpus='0',
         )
         self.dataset_cfg = datasets.functional.common.more(
             configs.BaseConfig(
-                '/home/wu/Documents/projects/my_projects/Trackerless_3D_Ultrasound_Reconstruction/res/datasets/TUS_complete_scan.json'
+                '/home/wu/Documents/projects/my_projects/Trackerless_3D_Ultrasound_Reconstruction/res/datasets/TUS_LSTM_edge_complete_scan.json'
             )
         )
 
@@ -119,8 +97,8 @@ class Main(object):
             batch_size=1,
             shuffle=True,
             collate_fn=getattr(self.trainset.dataset, 'collate_fn', None),
-            num_workers=self.dataset.cfg.num_workers,   # already 0 in TUS_complete_scan
-            pin_memory=self.dataset.cfg.pin_memory,     # already False
+            num_workers=self.dataset.cfg.num_workers,
+            pin_memory=self.dataset.cfg.pin_memory,
             sampler=None,
         )
         self.val_loader = torch.utils.data.DataLoader(
@@ -253,25 +231,62 @@ class Main(object):
         self.logger.save_npy(predict_file, predict)
 
     def val_test(self, epoch):
-        self.test(epoch, data_loader=self.val_loader,  log_text='Val')
-        self.test(epoch, data_loader=self.test_loader, log_text='Test')
+        self.test(epoch, data_loader=self.val_loader, log_text='Val')
+        self.test_loss(epoch, data_loader=self.val_loader, prefix='val')
+
+    # ------------------------------------------------------------------
+    # Test-set loss evaluation (no gradient update)
+    # ------------------------------------------------------------------
+
+    def test_loss(self, epoch, data_loader=None, prefix='test'):
+        """Compute self-supervised loss on a split and save to *_{prefix}_loss.npy."""
+        _empty_cache()
+        data_loader = data_loader or self.test_loader
+        n_scans  = len(data_loader)
+        loss_all = {}
+
+        epoch_info = {
+            'epoch':           epoch,
+            'batch_per_epoch': n_scans,
+            'count_data':      n_scans,
+        }
+
+        for scan_idx, (sample_dict, index) in enumerate(data_loader):
+            epoch_info['batch_idx']   = scan_idx
+            epoch_info['index']       = index
+            epoch_info['batch_count'] = 1
+
+            loss_dict = self.model.eval_loss(epoch_info, sample_dict)
+            loss_dict['_count'] = 1
+            utils.common.merge_dict(loss_all, loss_dict)
+
+        loss_file = os.path.join(
+            self.path,
+            self.model.name + '_' + str(epoch) + '_' + prefix + '_loss.npy',
+        )
+        self.logger.save_npy(
+            loss_file,
+            {k: v.cpu().detach().numpy() if isinstance(v, torch.Tensor) else v
+             for k, v in loss_all.items()},
+        )
+        self.logger.info('{} loss saved to {}'.format(prefix.capitalize(), loss_file))
+        self.plot_loss_curve()
 
     # ------------------------------------------------------------------
     # Loss curve plotting
     # ------------------------------------------------------------------
 
-    def plot_loss_curve(self):
-        pattern = os.path.join(self.path, self.model.name + '_*' + configs.env.paths.loss_file)
+    def _load_loss_files(self, suffix):
+        """Load per-epoch loss .npy files matching *<suffix> and return (epochs, loss_data)."""
+        regex   = re.compile(r'_(\d+)' + re.escape(suffix) + r'$')
+        pattern = os.path.join(self.path, self.model.name + '_*' + suffix)
         files   = sorted(
-            glob.glob(pattern),
-            key=lambda p: int(re.search(r'_(\d+)_loss\.npy$', p).group(1)),
+            [p for p in glob.glob(pattern) if regex.search(p)],
+            key=lambda p: int(regex.search(p).group(1)),
         )
-        if not files:
-            return
-
         epochs, loss_data = [], {}
         for fpath in files:
-            m = re.search(r'_(\d+)_loss\.npy$', fpath)
+            m = regex.search(fpath)
             if m is None:
                 continue
             ep   = int(m.group(1))
@@ -283,29 +298,45 @@ class Main(object):
                 val    = np.array(val, dtype=np.float32).flatten()
                 scalar = float(np.dot(count[:len(val)], val[:len(count)]) / count_sum)
                 loss_data.setdefault(key, []).append(scalar)
+        return epochs, loss_data
 
-        if not epochs:
+    def plot_loss_curve(self):
+        train_epochs, train_data = self._load_loss_files('_loss.npy')
+        val_epochs,   val_data   = self._load_loss_files('_val_loss.npy')
+        if not train_epochs and not val_epochs:
             return
 
-        keys  = [k for k in loss_data if k != 'loss']
-        n     = len(keys) + 1
+        all_keys = ['loss'] + sorted({
+            k for d in (train_data, val_data) for k in d if k != 'loss'
+        })
+        n     = len(all_keys)
         ncols = min(n, 3)
         nrows = (n + ncols - 1) // ncols
 
         fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
         axes_flat  = axes.flatten()
 
-        for i, key in enumerate(['loss'] + keys):
+        for i, key in enumerate(all_keys):
             ax = axes_flat[i]
-            ax.plot(epochs, loss_data[key], marker='o', markersize=3)
+            plotted = False
+            if key in train_data and train_epochs:
+                ax.plot(train_epochs, train_data[key], marker='o', markersize=3,
+                        color='steelblue', label='train')
+                plotted = True
+            if key in val_data and val_epochs:
+                ax.plot(val_epochs, val_data[key], marker='^', markersize=3,
+                        color='seagreen', label='val')
+                plotted = True
             ax.set_title(key)
             ax.set_xlabel('Epoch')
             ax.grid(True)
+            if plotted:
+                ax.legend(fontsize=8)
 
         for j in range(n, len(axes_flat)):
             axes_flat[j].set_visible(False)
 
-        fig.suptitle('Fine-tuning Loss Curves (CPU, scan-level)', fontsize=14)
+        fig.suptitle('Fine-tuning Loss Curves (GPU, scan-level)', fontsize=14)
         plt.tight_layout()
         save_path = os.path.join(self.path, 'loss_curve.png')
         plt.savefig(save_path, dpi=120)
@@ -316,13 +347,16 @@ class Main(object):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run():
+
     main = Main()
     main.split()
 
+    # if main.start_epoch == 0:
+    #     main.val_test(main.start_epoch)
     for epoch in range(main.start_epoch + 1, main.run_cfg.epochs + 1):
         main.train(epoch)
-        # if epoch % main.run_cfg.save_step == 0:
-        #     main.val_test(epoch)
+        if epoch % main.run_cfg.save_step == 0:
+            main.val_test(epoch)
 
 
 if __name__ == '__main__':

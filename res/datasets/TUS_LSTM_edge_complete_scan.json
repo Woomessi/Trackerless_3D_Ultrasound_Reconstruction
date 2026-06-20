@@ -10,7 +10,7 @@
   "source": {
     "width":   640,
     "height":  480,
-    "channel": 2
+    "channel": 4
   },
   "target": {
     "elements": 15

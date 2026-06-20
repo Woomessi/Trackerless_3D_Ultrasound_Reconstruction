@@ -1,16 +1,17 @@
 {
-  "name": "TUS_complete_scan",
+  "name": "TUS_LSTM_edge_complete",
   "paths": {
     "h5":    "/media/wu/Extreme SSD/datasets/11178509/train_part1",
     "calib": "data/calib_matrix.csv"
   },
   "train_val_test_split": [0.80, 0.10, 0.10],
   "train_test_range": [1, 1, 1],
-  "series_per_data":  [1, 1, 1],
+  "series_per_data":  [50, 10, 10],
+  "frame_rate": [2, 8],
   "source": {
     "width":   640,
     "height":  480,
-    "channel": 2
+    "channel": 4
   },
   "target": {
     "elements": 15

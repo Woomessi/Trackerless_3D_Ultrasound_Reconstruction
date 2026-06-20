@@ -1,22 +1,31 @@
 """
-Inference script for Online_Baseline_Backbone.
+Memory-efficient inference for Online_RecON_Backbone.
 
-Loads the latest checkpoint (epoch 5) from
-  save/online_baseline_bk-hp_bk-TUS_subject/
-and runs it on one .h5 file from data/frames_transfs/.
+Optimizations vs infer_RecON_baseline.py:
+  1. Source frames kept on CPU; edge maps computed in GPU micro-batches then
+     immediately moved back to CPU.
+  2. Optical flow result collected on CPU (CUDA-OpenCV path already does this;
+     RAFT path benefits from slices.device == cpu).
+  3. Full input tensor (1, N-1, 6, H, W) built on CPU; only one chunk is
+     transferred to GPU at a time during inference.
+  4. Backbone.forward now accepts and returns the LSTM hidden state so the
+     sequence can be processed in fixed-size chunks without losing context.
+  5. Automatic mixed precision (FP16 activations) via torch.amp.autocast.
+  6. Intermediate tensors freed with del + torch.cuda.empty_cache() at each step.
 
-Outputs are saved to infer_baseline_output/:
-  - predicted_gaps.npy   : (N-1, 6)  [tx, ty, tz, rx, ry, rz]
-  - predicted_series.npy : (N,   3, 3) world-mm frame positions
-  - gt_series.npy        : (N,   3, 3) ground-truth series
-  - trajectory_3d.png    : 3D centre-point trajectories + sampled frame quads
-  - trajectory_2d.png    : 2D projections + per-axis error curves
+Tunable knobs (see constants below):
+  INFER_CHUNK  -- frames per LSTM chunk  (lower → less GPU RAM, more iterations)
+  EDGE_CHUNK   -- frames per Canny batch (lower → less GPU RAM, more iterations)
 """
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+_PROJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _PROJ_ROOT not in sys.path:
+    sys.path.insert(0, _PROJ_ROOT)
+
+import contextlib
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -27,19 +36,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import h5py
+import timm
+
+import models
+from utils.image import get_optical_flow, get_edge
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-H5_PATH    = "/media/wu/Extreme SSD/datasets/11178509/train_part1/025/LH_Par_L_PtD.h5"
-# H5_PATH     = "../../data/frames_transfs/001/LH_Per_L_DtP.h5"
+H5_PATH    = "/media/wu/Extreme SSD/datasets/11178509/train_part1/022/LH_Par_L_PtD.h5"
 CALIB_PATH = "../../data/calib_matrix.csv"
-CKPT_PATH  = "../../save/online_baseline_bk-hp_bk-TUS_complete/online_baseline_bk_backbone_230.pth"
-OUT_DIR    = "../../infer_baseline_output"
+CKPT_PATH  = "../../save/online_RecON_bk-hp_bk-TUS_complete/online_RecON_bk_backbone_10.pth"
+OUT_DIR    = "../../infer_RecON_baseline_output"
 
 # ── Model config (must match training) ────────────────────────────────────────
-IN_PLANES   = 2   # two consecutive frames (channel=2)
-NUM_CLASSES = 6   # target.elements(15) - 9 = 6 gaps (tx,ty,tz,rx,ry,rz)
+IN_PLANES   = 6
+NUM_CLASSES = 6
 IMG_H, IMG_W = 480, 640
-BATCH_PAIRS  = 1  # number of frame-pairs to process at once (memory budget)
+
+# ── Memory-saving knobs ───────────────────────────────────────────────────────
+INFER_CHUNK = 50   # LSTM inference frames per chunk — reduce if still OOM
+EDGE_CHUNK  = 32   # Canny edge frames per GPU batch — reduce if still OOM
 
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -47,32 +62,52 @@ print(f"Using device: {device}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backbone (copy of the class in models/online_baseline_backbone.py)
+# Backbone — identical architecture; forward now accepts/returns LSTM hidden
+# state so the caller can chunk the sequence without losing temporal context.
 # ─────────────────────────────────────────────────────────────────────────────
-import timm
-
 class Backbone(nn.Module):
+
     def __init__(self, in_planes, num_classes):
         super().__init__()
-        self.efficientnet_b1 = timm.create_model(
-            'efficientnet_b1', pretrained=False,
-            in_chans=in_planes, num_classes=num_classes
+        self.resnet = timm.create_model(
+            'resnet18', pretrained=False,
+            in_chans=in_planes, num_classes=0, global_pool=''
+        )
+        self.lstm = models.layers.convolutional_rnn.Conv2dLSTM(
+            512, 512, kernel_size=3, batch_first=True
         )
         self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(512, num_classes)
 
-    def forward(self, x):
-        """x: (B, T, C, H, W)  →  out: (B, T, num_classes)"""
+    def forward(self, x, hx=None, return_feature=False):
+        """
+        x   : (B, T, C, H, W)
+        hx  : LSTM hidden state from previous chunk, or None for first chunk
+        Returns (out, feature, hx_new)
+          out     : (B, T, num_classes)
+          feature : (B, T, 512) if return_feature else None
+          hx_new  : hidden state to pass into the next chunk
+        """
         b, t, c, h, w = x.shape
         x = (x - torch.mean(x, dim=[3, 4], keepdim=True)) / \
             (torch.std(x, dim=[3, 4], keepdim=True) + 1e-6)
         x = x.view(b * t, c, h, w)
-        x = self.efficientnet_b1(x)           # (B*T, num_classes)
-        x = x.view(b, t, *x.shape[1:])        # (B, T, num_classes)
-        return x
+        x = self.resnet(x)
+        x = x.view(b, t, *x.shape[1:])
+        if return_feature:
+            f = self.avg(x)
+            f = f.view(f.size(0), f.size(1), -1)
+        else:
+            f = None
+        x, hx = self.lstm(x, hx)           # carry hidden state across chunks
+        x = self.avg(x)
+        x = x.view(x.size(0), x.size(1), -1)
+        x = self.fc(x)
+        return x, f, hx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calibration helpers  (from utils/plot_functions.py)
+# Calibration helpers  (unchanged from infer_RecON_baseline.py)
 # ─────────────────────────────────────────────────────────────────────────────
 def read_calib_matrices(filename_calib):
     tform_calib = np.empty((8, 4), np.float32)
@@ -80,49 +115,44 @@ def read_calib_matrices(filename_calib):
         txt = [i.strip('\n').split(',') for i in csv_file.readlines()]
         tform_calib[0:4, :] = np.array(txt[1:5]).astype(np.float32)
         tform_calib[4:8, :] = np.array(txt[6:10]).astype(np.float32)
-    calib_scale   = torch.tensor(tform_calib[0:4, :])
-    calib_R_T     = torch.tensor(tform_calib[4:8, :])
-    calib         = torch.tensor(tform_calib[4:8, :] @ tform_calib[0:4, :])
+    calib_scale = torch.tensor(tform_calib[0:4, :])
+    calib_R_T   = torch.tensor(tform_calib[4:8, :])
+    calib       = torch.tensor(tform_calib[4:8, :] @ tform_calib[0:4, :])
     return calib_scale, calib_R_T, calib
 
 
 def build_series(tforms_np, calib_path, H_out, W_out):
-    """Compute series (N, 3, 3) = [center, lower-left, lower-right] in world mm.
-
-    Replicates TUS_subject._build_series().
-    """
-    tforms = torch.from_numpy(tforms_np)               # (N, 4, 4)
+    tforms = torch.from_numpy(tforms_np)
     N = tforms.shape[0]
 
-    # Transform each frame to frame-0 coordinate
-    pairs = torch.tensor([[0, n] for n in range(N)])   # (N, 2)
+    pairs = torch.tensor([[0, n] for n in range(N)])
     tforms_inv = torch.linalg.inv(tforms)
-    tforms_world_to_f0 = tforms_inv[pairs[:, 0]]       # (N, 4, 4)
-    tforms_fn_to_world = tforms[pairs[:, 1]]           # (N, 4, 4)
+    tforms_world_to_f0 = tforms_inv[pairs[:, 0]]
+    tforms_fn_to_world  = tforms[pairs[:, 1]]
     tforms_f2f0 = torch.matmul(tforms_world_to_f0, tforms_fn_to_world)
 
     _, calib_R_T, calib = read_calib_matrices(calib_path)
     T_combined = torch.matmul(
         torch.linalg.inv(calib_R_T).unsqueeze(0),
         torch.matmul(tforms_f2f0, calib.unsqueeze(0)),
-    )  # (N, 4, 4)
+    )
 
     pixel_pts = torch.tensor(
         [[W_out / 2.0, H_out / 2.0, 0.0, 1.0],
          [1.0,         float(H_out), 0.0, 1.0],
          [float(W_out), float(H_out), 0.0, 1.0]],
         dtype=T_combined.dtype,
-    ).T  # (4, 3)
+    ).T
 
     world_pts = torch.bmm(
         T_combined,
         pixel_pts.unsqueeze(0).expand(N, 4, 3)
     )
-    return world_pts[:, :3, :].permute(0, 2, 1)   # (N, 3, 3)
+    return world_pts[:, :3, :].permute(0, 2, 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# dof_to_series  (from utils/simulation.py)
+# dof_to_series  (unchanged from infer_RecON_baseline.py)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_axis(series):
     v1 = series[:, 2, :] - series[:, 1, :]
@@ -134,7 +164,6 @@ def get_axis(series):
 
 
 def euler_matrix_batch(angles):
-    """angles: (B, 3) in radians → rotation matrices (B, 4, 4)."""
     ai, aj, ak = angles[:, 0], angles[:, 1], angles[:, 2]
     si, sj, sk = torch.sin(ai), torch.sin(aj), torch.sin(ak)
     ci, cj, ck = torch.cos(ai), torch.cos(aj), torch.cos(ak)
@@ -157,11 +186,6 @@ def euler_matrix_batch(angles):
 
 
 def dof_to_series(start_point, dof):
-    """
-    start_point : (1, 3, 3)  – first frame's series
-    dof         : (1, T, 6)  – predicted gaps
-    Returns     : (T+1, 3, 3) full series including the start frame
-    """
     old_type = start_point.dtype
     start_point = start_point.double()
     dof = dof.double()
@@ -172,22 +196,21 @@ def dof_to_series(start_point, dof):
     matrix[:, :3, 3] = dof_flat[:, :3]
     matrix = matrix.view(b, t, 4, 4)
 
-    start_axis = get_axis(start_point).permute(0, 2, 1)        # (1, 3, 3)
+    start_axis = get_axis(start_point).permute(0, 2, 1)
     start_matrix = torch.cat(
         [start_axis, start_point[:, 0, :].unsqueeze(-1)], dim=-1
-    )                                                           # (1, 3, 4)
-    start_matrix = F.pad(start_matrix, (0, 0, 0, 1))           # (1, 4, 4)
+    )
+    start_matrix = F.pad(start_matrix, (0, 0, 0, 1))
     start_matrix[:, 3, 3] = 1.0
     start_matrix_inv = torch.linalg.inv(start_matrix)
 
     matrix_chain = [start_matrix]
     for idx in range(matrix.shape[1]):
         matrix_chain.append(torch.bmm(matrix_chain[-1], matrix[:, idx]))
-    matrix_chain = torch.stack(matrix_chain, dim=1)             # (1, T+1, 4, 4)
+    matrix_chain = torch.stack(matrix_chain, dim=1)
 
     start_point_4d = F.pad(start_point, (0, 1))
     start_point_4d[:, :, 3] = 1.0
-    # (1, T+1, 3, 3)
     series = torch.einsum(
         'btij,bjk,bkl->btil',
         matrix_chain,
@@ -195,7 +218,7 @@ def dof_to_series(start_point, dof):
         start_point_4d.permute(0, 2, 1),
     ).permute(0, 1, 3, 2)[..., :3]
 
-    return series.squeeze(0).to(old_type)                       # (T+1, 3, 3)
+    return series.squeeze(0).to(old_type)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,91 +227,134 @@ def dof_to_series(start_point, dof):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # 1. Load h5 file ──────────────────────────────────────────────────────────
+    # AMP context: enabled only on CUDA
+    if device.type == 'cuda':
+        autocast_ctx = torch.amp.autocast(device_type='cuda')
+    else:
+        autocast_ctx = contextlib.nullcontext()
+
+    # 1. Load h5 ───────────────────────────────────────────────────────────────
     print(f"Loading: {H5_PATH}")
     with h5py.File(H5_PATH, 'r') as f:
-        frames_np = f['frames'][()]    # (N, H_orig, W_orig) uint8
-        tforms_np = f['tforms'][()]    # (N, 4, 4) float32
+        frames_np = f['frames'][()]
+        tforms_np = f['tforms'][()]
     N, H_orig, W_orig = frames_np.shape
     print(f"  frames: {frames_np.shape}, tforms: {tforms_np.shape}")
 
-    # 2. Build ground-truth series ─────────────────────────────────────────────
-    print("Building GT series from calibration ...")
-    gt_series = build_series(tforms_np, CALIB_PATH, IMG_H, IMG_W)  # (N, 3, 3)
+    # 2. Ground-truth series (CPU) ─────────────────────────────────────────────
+    print("Building GT series ...")
+    gt_series = build_series(tforms_np, CALIB_PATH, IMG_H, IMG_W)
     print(f"  gt_series: {gt_series.shape}")
 
-    # 3. Prepare source frames ─────────────────────────────────────────────────
-    source = torch.from_numpy(frames_np.astype(np.float32) / 255.0)  # (N, H, W)
+    # 3. Source frames on CPU ──────────────────────────────────────────────────
+    # Optimization: keep source on CPU to avoid holding N × H × W on GPU.
+    source_cpu = torch.from_numpy(frames_np.astype(np.float32) / 255.0)  # (N, H, W)
+    del frames_np
     if H_orig != IMG_H or W_orig != IMG_W:
-        source = F.interpolate(
-            source.unsqueeze(1), size=(IMG_H, IMG_W),
+        source_cpu = F.interpolate(
+            source_cpu.unsqueeze(1), size=(IMG_H, IMG_W),
             mode='bilinear', align_corners=False,
         ).squeeze(1)
-    # source: (N, H, W)  → add channel dim  → (N, 1, H, W)
-    source = source.unsqueeze(1)
+    print(f"  source (CPU): {source_cpu.shape}")
 
-    # 4. Build pair inputs: (N-1, 2, H, W) ────────────────────────────────────
-    # Model expects (B, T, C, H, W) where C=2 = [frame_i, frame_{i+1}]
-    pairs = torch.cat([source[:-1], source[1:]], dim=1)  # (N-1, 2, H, W)
-    print(f"  pair input shape: {pairs.shape}")
+    # 4. Edge maps — computed in GPU micro-batches, stored on CPU ──────────────
+    # Optimization: never hold all N edge maps on GPU simultaneously.
+    print(f"Computing edge maps in chunks of {EDGE_CHUNK} ...")
+    edge_chunks = []
+    for start in range(0, N, EDGE_CHUNK):
+        chunk = source_cpu[start:start + EDGE_CHUNK].to(device)
+        with torch.no_grad():
+            e = get_edge(chunk, device=device)          # (c, 1, H, W) on GPU
+        edge_chunks.append(e.cpu())
+        del chunk, e
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+    edge_cpu = torch.cat(edge_chunks, dim=0)            # (N, 1, H, W) on CPU
+    del edge_chunks
+    print(f"  edge (CPU): {edge_cpu.shape}")
 
-    # 5. Load model ────────────────────────────────────────────────────────────
+    # 5. Optical flow — result on CPU ──────────────────────────────────────────
+    # Passing source_cpu (device=cpu) makes get_optical_flow return a CPU tensor.
+    # RAFT: flows computed on GPU one-by-one, final cat moved to slices.device=cpu.
+    # CUDA-OpenCV: already uses CPU numpy internally.
+    print("Computing optical flow ...")
+    optical_flow_cpu = get_optical_flow(source_cpu, device=device)   # (N-1, 2, H, W) CPU
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    print(f"  optical_flow (CPU): {optical_flow_cpu.shape}")
+
+    # 6. Build full input tensor on CPU ────────────────────────────────────────
+    # Optimization: (1, N-1, 6, H, W) lives on CPU; GPU sees only one chunk.
+    print("Building model input tensor (CPU) ...")
+    s  = source_cpu.unsqueeze(1).unsqueeze(0)       # (1, N,   1, H, W)
+    e  = edge_cpu.unsqueeze(0)                       # (1, N,   1, H, W)
+    of = optical_flow_cpu.unsqueeze(0)               # (1, N-1, 2, H, W)
+    inp_cpu = torch.cat([s[:, :-1], s[:, 1:], e[:, :-1], e[:, 1:], of], dim=2)
+    print(f"  inp (CPU): {inp_cpu.shape}")           # (1, N-1, 6, H, W)
+
+    del source_cpu, edge_cpu, optical_flow_cpu, s, e, of
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    # 7. Load model ────────────────────────────────────────────────────────────
     print(f"Loading backbone from: {CKPT_PATH}")
     backbone = Backbone(in_planes=IN_PLANES, num_classes=NUM_CLASSES).to(device)
     state = torch.load(CKPT_PATH, map_location=device, weights_only=True)
+    if any(k.startswith('_orig_mod.') for k in state):
+        state = {k.replace('_orig_mod.', '', 1): v for k, v in state.items()}
     backbone.load_state_dict(state)
     backbone.eval()
     print("  Model loaded.")
 
-    # 6. Inference in mini-batches ─────────────────────────────────────────────
-    print(f"Running inference on {N-1} frame pairs (batch_size={BATCH_PAIRS}) ...")
+    # 8. Chunked LSTM inference ────────────────────────────────────────────────
+    # Optimization: send INFER_CHUNK frames at a time; carry LSTM hidden state
+    # across chunks so temporal context is never broken.
+    print(f"Running inference in chunks of {INFER_CHUNK} frames ...")
     all_gaps = []
-    with torch.no_grad():
-        for start in range(0, N - 1, BATCH_PAIRS):
-            end = min(start + BATCH_PAIRS, N - 1)
-            batch = pairs[start:end].unsqueeze(0).to(device)  # (1, end-start, 2, H, W)
-            out = backbone(batch)                              # (1, end-start, 6)
-            all_gaps.append(out.squeeze(0).cpu())             # (end-start, 6)
+    hx = None
+    with torch.no_grad(), autocast_ctx:
+        for start in range(0, N - 1, INFER_CHUNK):
+            chunk = inp_cpu[:, start:start + INFER_CHUNK].to(device)
+            out, _, hx = backbone(chunk, hx)        # (1, chunk_t, 6)
+            all_gaps.append(out.squeeze(0).float().cpu())
+            del chunk
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
 
-    fake_gaps = torch.cat(all_gaps, dim=0)   # (N-1, 6)
-    # De-scale angles (×100 during training → ÷100 here)
+    fake_gaps = torch.cat(all_gaps, dim=0)          # (N-1, 6)
+    del all_gaps, hx, inp_cpu
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     fake_gaps[:, 3:] /= 100.0
-    print(f"  predicted gaps shape: {fake_gaps.shape}")
+    print(f"  predicted gaps: {fake_gaps.shape}")
 
-    # 7. Reconstruct series from predicted gaps ────────────────────────────────
+    # 9. Reconstruct series ────────────────────────────────────────────────────
     print("Reconstructing predicted series ...")
-    start_frame = gt_series[0:1]                              # (1, 3, 3)
-    pred_series = dof_to_series(
-        start_frame,                                          # (1, 3, 3)
-        fake_gaps.unsqueeze(0),                               # (1, N-1, 6)
-    )                                                          # (N, 3, 3)
-    print(f"  predicted series shape: {pred_series.shape}")
+    start_frame = gt_series[0:1]
+    pred_series = dof_to_series(start_frame, fake_gaps.unsqueeze(0))
+    print(f"  predicted series: {pred_series.shape}")
 
-    # 8. Save outputs ──────────────────────────────────────────────────────────
+    # 10. Save outputs ─────────────────────────────────────────────────────────
     np.save(os.path.join(OUT_DIR, "predicted_gaps.npy"),   fake_gaps.numpy())
     np.save(os.path.join(OUT_DIR, "predicted_series.npy"), pred_series.numpy())
     np.save(os.path.join(OUT_DIR, "gt_series.npy"),        gt_series.numpy())
-    print(f"\nResults saved to '{OUT_DIR}/':")
-    print(f"  predicted_gaps.npy   {fake_gaps.shape}  (tx,ty,tz,rx,ry,rz per pair)")
-    print(f"  predicted_series.npy {pred_series.shape}  (world-mm frame positions)")
-    print(f"  gt_series.npy        {gt_series.shape}  (ground-truth)")
+    print(f"\nResults saved to '{OUT_DIR}/'")
 
-    # 9. Quick sanity stats ────────────────────────────────────────────────────
+    # 11. Quick sanity stats ───────────────────────────────────────────────────
     dist_err = torch.norm(
         pred_series[:, 0, :] - gt_series[:, 0, :], dim=-1
     ).mean().item()
-    print(f"\nMean center-point distance error: {dist_err:.4f} mm")
+    print(f"Mean center-point distance error: {dist_err:.4f} mm")
 
-    # 10. Visualize ────────────────────────────────────────────────────────────
+    # 12. Visualize ────────────────────────────────────────────────────────────
     visualize(gt_series.numpy(), pred_series.numpy(), OUT_DIR)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Visualization
+# Visualization  (unchanged from infer_RecON_baseline.py)
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _series_to_corners(s):
-    """s: (N, 3, 3) → corners (N, 4, 3)  [ll, lr, ur, ul]"""
     center, ll, lr = s[:, 0], s[:, 1], s[:, 2]
     ur = 2 * center - ll
     ul = 2 * center - lr
@@ -304,7 +370,6 @@ def _add_quads(ax, series, color, alpha=0.25, step=50):
 
 
 def _set_axes_equal_3d(ax):
-    """Force equal aspect ratio on a 3D axes by expanding shorter axes to match the longest."""
     limits = np.array([ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()])
     centers = limits.mean(axis=1)
     half_range = (limits[:, 1] - limits[:, 0]).max() / 2.0
@@ -314,15 +379,10 @@ def _set_axes_equal_3d(ax):
 
 
 def visualize(gt, pred, out_dir):
-    """
-    gt, pred : (N, 3, 3) numpy arrays
-    Saves trajectory_3d.png and trajectory_2d.png to out_dir.
-    """
     n = gt.shape[0]
-    gt_center   = gt[:, 0, :]    # (N, 3)
+    gt_center   = gt[:, 0, :]
     pred_center = pred[:, 0, :]
 
-    # ── Figure 1: 3D trajectories ─────────────────────────────────────────────
     fig = plt.figure(figsize=(14, 6))
     t = np.linspace(0, 1, n)
 
@@ -368,7 +428,6 @@ def visualize(gt, pred, out_dir):
     plt.close()
     print(f"Saved: {path}")
 
-    # ── Figure 2: 2D projections + per-axis error ─────────────────────────────
     frame_idx = np.arange(n)
     dist_err  = np.linalg.norm(pred_center - gt_center, axis=-1)
 

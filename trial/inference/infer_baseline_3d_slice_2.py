@@ -284,7 +284,7 @@ def main():
     # 5. Load model ────────────────────────────────────────────────────────────
     print(f"Loading backbone from: {CKPT_PATH}")
     backbone = Backbone(in_planes=IN_PLANES, num_classes=NUM_CLASSES).to(device)
-    state = torch.load(CKPT_PATH, map_location=device)
+    state = torch.load(CKPT_PATH, map_location=device, weights_only=True)
     backbone.load_state_dict(state)
     backbone.eval()
     print("  Model loaded.")

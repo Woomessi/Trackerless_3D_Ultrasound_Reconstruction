@@ -215,7 +215,7 @@ def main():
     ckpt_abs = os.path.join(_ROOT, CKPT_PATH)
     print(f"\n[3] Loading backbone checkpoint: {ckpt_abs}")
     backbone = Backbone(IN_PLANES, NUM_CLASSES).to(DEVICE)
-    backbone.load_state_dict(torch.load(ckpt_abs, map_location=DEVICE))
+    backbone.load_state_dict(torch.load(ckpt_abs, map_location=DEVICE, weights_only=True))
     backbone.eval()
 
     pairs = torch.cat([source[:-1], source[1:]], dim=1)   # (N-1, 2, H, W)

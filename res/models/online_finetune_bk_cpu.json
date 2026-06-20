@@ -10,8 +10,18 @@
   "grad_clip_norm": 0.5,
   "max_reco_voxels": 500000000,
 
-  "weight_loss1":       0.6,
-  "weight_loss_rot":    0.4,
-  "weight_loss_jagged": 0.0,
-  "weight_loss_ssim":   0.0
+  "weight_loss1":             0.0,
+  "weight_loss_rot":          0.0,
+  "weight_loss_jagged":       1.0,
+  "weight_loss_ssim":         0.0,
+  "rotation_max_angle":       0.5,
+
+  "slice_content_thresh":     0.02,
+  "slice_min_content_ratio":  0.05,
+
+  "jagged_mask_thresh":       0.02,
+
+  "weight_loss_consistency":  1.0,
+  "consistency_angle":        1.57,
+  "consistency_loss_fn":      "l1"
 }

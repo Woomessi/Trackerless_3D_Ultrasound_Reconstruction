@@ -77,7 +77,7 @@ class BaseModel(_ProcessHook, metaclass=abc.ABCMeta):
         if start_epoch is None:
             check_path = os.path.join(path, self.name + configs.env.paths.check_file)
             if os.path.exists(check_path):
-                check_data = torch.load(check_path)
+                check_data = torch.load(check_path, weights_only=True)
                 start_epoch = check_data['epoch']
                 self.main_msg = check_data['main_msg']
             else:
@@ -89,7 +89,7 @@ class BaseModel(_ProcessHook, metaclass=abc.ABCMeta):
                     if not os.path.exists(load_path) and isinstance(value, torch.optim.Optimizer):
                         self.logger.info(f"IGNORE! Optimizer weight `{load_path}` not found!")
                         continue
-                    load_value = torch.load(load_path, map_location=self.device)
+                    load_value = torch.load(load_path, map_location=self.device, weights_only=False)
                     if isinstance(value, (nn.Module, torch.optim.Optimizer)):
                         self.__dict__[name].load_state_dict(load_value)
                     else:
